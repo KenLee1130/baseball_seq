@@ -43,7 +43,7 @@ def make_df(pa_lengths, speeds=None):
                 "description": "foul" if p < n else "hit_into_play", "launch_speed": 88.0 if p < n else 101.0,
                 "ev_measured": 88.0 if p < n else 101.0, "is_model_target": True, "use_as_target": True,
                 "is_swing": True, "is_contact": True, "contact3": 2 if p == n else 0,
-                "count_state": "0-0", "base_out_state": 0, "prev1_pa_result_class": None,
+                "count_state": "0-0", "base_out_state": 0, "prev1_pa_result_class": None, "zone": 5.0,
                 **{c: 1.0 for c in F.CTX_BASE}, **{c: 0.4 for c in F.PROFILE_PREV + F.PROFILE_RECENT},
                 "is_rookie": False, "recent_window_sufficient": True,
             })

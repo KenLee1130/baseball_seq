@@ -1,6 +1,7 @@
 # PyTorch 使用 CUDA 12.1 版本 (本機驅動支援到 CUDA 12.2)
 --extra-index-url https://download.pytorch.org/whl/cu121
 torch==2.5.1+cu121
+matplotlib==3.11.1
 numpy==2.4.6
 pandas==3.0.5
 pyarrow==25.0.1

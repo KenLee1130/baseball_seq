@@ -54,6 +54,19 @@ def test_prev_season_reads_only_previous_year(interim):
     assert (prof["source_season"] == 2023).all()
 
 
+def test_hardhit_rate_by_height(interim):
+    interim(2023,
+            pitches(A, "2023-06-01", 100, bip=True, zone=2, ls=105.0),   # 高球全部強擊
+            pitches(A, "2023-06-01", 100, bip=True, zone=8, ls=70.0),    # 低球全部弱擊
+            pitches(B, "2023-06-01", 100, bip=True, zone=2, ls=70.0),
+            pitches(B, "2023-06-01", 100, bip=True, zone=8, ls=105.0))
+    prof = bp.build_prev_season(2024).set_index("batter")
+    assert prof.loc[A, "prev_season_hardhit_rate_high"] > prof.loc[A, "prev_season_hardhit_rate_low"]
+    assert prof.loc[B, "prev_season_hardhit_rate_high"] < prof.loc[B, "prev_season_hardhit_rate_low"]
+    league = prof.loc[bp.LEAGUE_ROW_ID]
+    assert league["prev_season_hardhit_rate_high"] == pytest.approx(0.5)
+
+
 def test_no_bat_tracking_is_nan_not_zero(interim):
     interim(2015, pitches(A, "2015-06-01", 50), pitches(B, "2015-06-01", 50))
     prof = bp.build_prev_season(2016)

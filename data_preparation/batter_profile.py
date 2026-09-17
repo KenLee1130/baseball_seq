@@ -6,7 +6,8 @@ batter_profile.py
   1. 上一季輪廓 (prev_season_*)
      輸入:  dataset/interim/pitches_{Y-1}.parquet
      輸出:  dataset/interim/batter_prev_season_{Y}.parquet   (一位打者一列，供賽季 Y 使用)
-     內容:  揮棒機制、各球種族 x 區域的揮棒/揮空率、各球種族追打率、擊球品質、拉打率
+     內容:  揮棒機制、各球種族 x 區域的揮棒/揮空率、各球種族追打率、擊球品質、拉打率、
+            好球帶上/中/下的強擊率
 
   2. 近期輪廓 (recent_*)
      輸入:  dataset/interim/pitches_{Y}.parquet (+ 上一季輪廓作為退路)
@@ -171,6 +172,12 @@ def build_prev_season(season: int) -> pd.DataFrame | None:
                      "prev_season_mean_attack_angle", "prev_season_fast_swing_rate"]:
             out[name] = np.nan
 
+    # -- 好球帶上 / 中 / 下的強擊率 (打進場的球)。不分球種族：18 格會讓每格擊球樣本太少 --
+    for reg in ("high", "mid", "low"):
+        cell = bip[bip["region"] == reg]
+        out[f"prev_season_hardhit_rate_{reg}"] = _rate_block(
+            cell, ["batter"], "is_hard", None, cell["is_hard"].mean(), W_BIP / 2, "x")
+
     # -- 各球種族：追打率、強擊率、平均初速 --
     for fam in FAMILIES:
         f_all, f_bip = df[df["pitch_family"] == fam], bip[bip["pitch_family"] == fam]
@@ -219,6 +226,8 @@ def _league_row(df, columns, swings, bip, chase, spray, has_bat_tracking) -> pd.
     row["prev_season_pull_rate"] = spray["is_pulled"].mean()
     row["prev_season_ev"] = bip["launch_speed"].mean()
     row["bat_tracking_available"] = has_bat_tracking
+    for reg in ("high", "mid", "low"):
+        row[f"prev_season_hardhit_rate_{reg}"] = bip.loc[bip["region"] == reg, "is_hard"].mean()
     if has_bat_tracking:
         tracked = swings.dropna(subset=["bat_speed"])
         row["prev_season_mean_bat_speed"] = tracked["bat_speed"].mean()

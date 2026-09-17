@@ -23,6 +23,7 @@ baseball_seq/
     model.py             ✅ Transformer 序列模型，輸出 7 類事件機率
     train.py             ✅ 依 config 訓練，輸出到 runs/<名稱>_<時間>/
     evaluate.py          ✅ 整體、三段式、分層、校準、歷史消融
+    curves.py            ✅ 各情況的 ROC 曲線與指標表格 (Precision、Recall、F1 ...)
   configs/
     event7_base.yaml     ✅ 基準實驗設定
   analysis/
@@ -46,7 +47,9 @@ python data_preparation/splits.py                        # 4. 檢查切分、輸
 python -m modeling.features --fit --build                # 5. 標準化參數 + 張量快取 (約 1.5 分鐘，11 GB)
 python -m modeling.outcomes --fit                        # 6. 各球數 x 事件的得分價值表 (只用 train)
 python -m modeling.train --config configs/event7_base.yaml         # 7. 訓練 (結束後自動在 val 上評估)
-python -m modeling.evaluate --run runs/<run> --split test          # 8. 模型定案後才在 test 上評估
+python -m modeling.curves --run runs/<run> --split val              # 8. 各情況 ROC 曲線與指標表格
+python -m modeling.evaluate --run runs/<run> --split test          # 9. 模型定案後才在 test 上評估
+python -m modeling.curves --run runs/<run> --split test
 
 python -m pytest tests/                                  # 測試
 ```
@@ -134,7 +137,7 @@ python -m pytest tests/                                  # 測試
 | `token_num` | [N, 21, 22] | **本打席**第 1 球到本球（本球在最後一格，不足 21 球的在前面補位）：物理量、與前一球的差異、歷史球初速、旗標 |
 | `token_cat` | [N, 21, 2] | 球種族、打者反應（本球的反應被遮蔽成 `<mask>`） |
 | `pad` | [N, 21] | 補位遮罩：第 N 球的樣本只有最後 N 格是真的球 |
-| `ctx_num` | [N, 101] | 情境、上一季輪廓、近期拉打率、新人旗標 |
+| `ctx_num` | [N, 104] | 情境、上一季輪廓、近期拉打率、新人旗標 |
 | `ctx_cat` | [N, 4] | 球數、base-out 狀態、投打慣用手組合 (RHP_RHB / RHP_LHB / LHP_RHB / LHP_LHB)、前一打席結果 |
 | 標籤 | [N] | `y_swing`、`y_contact` + `m_contact`、`y_ev` + `m_ev`、`y_contact3` + `m_contact3`（`m_*` 是各段的母體遮罩） |
 
@@ -184,6 +187,106 @@ python -m pytest tests/                                  # 測試
 - 強擊只看**打進場**的球，不用「觸球上的初速迴歸」：界外球初速在早期年份覆蓋率很低，而且配球決策在乎的是打進場的強擊
 - 觸擊、觸身球、打進場但缺初速的球不當標籤 (`m_event = False`)
 
+### 模型輸入完整清單
+每個樣本是一顆要預測的球。模型看到的全部資訊如下，定義在 `modeling/features.py`。
+
+#### 1. 序列：本打席第 1 球到本球（每顆球一格，最長 21 格）
+
+**每顆球的數值特徵（22 個，`token_num`）**
+
+| 分類 | 特徵 | 說明 |
+|---|---|---|
+| 物理量 (11) | `plate_x_bv` | 進壘水平位置，打者視角（正 = 外角） |
+| | `plate_z_norm` | 進壘高度，以打者好球帶正規化（0 = 下緣、1 = 上緣） |
+| | `release_speed` | 出手球速 |
+| | `effective_speed` | 考慮延伸後的等效球速 |
+| | `speed_vs_own_fastball` | 本球球速 − 投手本季至前一場的速球均速 |
+| | `pfx_x_bv` | 水平位移，打者視角 |
+| | `pfx_z` | 垂直位移 |
+| | `release_spin_rate` | 轉速 |
+| | `release_extension` | 延伸距離 |
+| | `release_pos_x_bv` | 出手點水平位置，打者視角 |
+| | `release_pos_z` | 出手點高度 |
+| 與前一球的差異 (8) | `d_release_speed` | 速差 |
+| | `d_plate_x_bv`、`d_plate_z_norm` | 進壘點水平差、垂直差 |
+| | `d_pfx_x_bv`、`d_pfx_z` | 水平位移差、垂直位移差 |
+| | `plate_dist` | 進壘點距離 |
+| | `release_dist` | 出手點距離 |
+| | `tunnel_ratio` | 進壘點距離 ÷ 出手點距離（越大越難辨識） |
+| 結果 (1) | `ev_measured` | 擊球初速；**本球遮蔽為 0** |
+| 旗標 (2) | `has_prev` | 同打席前面是否還有球 |
+| | `ev_present` | 是否量得到初速；**本球遮蔽為 0** |
+
+**每顆球的類別特徵（2 個，`token_cat`）**
+
+| 特徵 | 類別 |
+|---|---|
+| `pitch_family` | 速球、伸卡、卡特、滑球、曲球、變速球、其他 |
+| `pitch_outcome` | 壞球、看好球、揮空、界外、打進場、觸身球；**本球遮蔽為 `<mask>`** |
+
+另有 `pad` 遮罩：第 N 球的樣本只有最後 N 格是真的球，前面是補位。
+
+#### 2. 情境：本球當下（`ctx_num` 104 個數值 + `ctx_cat` 4 個類別）
+
+**比賽情境（13 個數值）**
+
+| 特徵 | 說明 |
+|---|---|
+| `inning` | 局數（10 局以上視為 10） |
+| `outs_when_up` | 出局數 |
+| `n_runners` | 壘上人數 |
+| `lineup_slot` | 棒次 |
+| `nth_pa_vs_pitcher` | 本場第幾次面對這位投手 |
+| `pitcher_pitch_count` | 投手本場用球數（含本球） |
+| `n_thruorder_pitcher` | 投手第幾輪面對打線 |
+| `bat_score_diff` | 進攻方分差（限制在 ±10） |
+| `pitcher_days_since_prev_game` | 投手距上次出賽天數（上限 30） |
+| `inning_batters_faced` | 本半局已面對幾位打者 |
+| `prev_pa_reached_count` | 前 3 個打席有幾人上壘 |
+| `age_bat`、`age_pit` | 打者年齡、投手年齡 |
+
+**打者上一季輪廓（82 個數值，只用前一季資料，向聯盟平均收縮）**
+
+| 分類 | 數量 | 特徵 |
+|---|---|---|
+| 整體 | 7 | 揮棒率、揮空率、追打率（好球帶外揮棒）、打進場率、強擊率（打進場 >95 mph）、拉打率、平均初速 |
+| 分高度 | 3 | 好球帶上、中、下的強擊率 |
+| 分球種族 | 24 | 6 個球種族（速球、伸卡、卡特、滑球、曲球、變速球）× 追打率、揮空率、強擊率、平均初速 |
+| 球種族 × 區域 | 48 | 6 個球種族 × 4 個區域（好球帶上、中、下、追打區）× 揮棒率、揮空率 |
+
+**打者近期輪廓（7 個數值）**
+
+| 特徵 | 說明 |
+|---|---|
+| `recent_pull_rate` | 比賽日前 30 天（不含當天）的拉打率；揮棒不到 50 次時退回上一季值 |
+| `recent_pull_rate_{球種族}` × 6 | 各球種族的近期拉打率 |
+
+**旗標（2 個數值）**
+
+| 特徵 | 說明 |
+|---|---|
+| `is_rookie` | 沒有上一季資料，輪廓填聯盟平均 |
+| `recent_window_sufficient` | 近 30 天揮棒至少 50 次 |
+
+**類別（4 個，`ctx_cat`）**
+
+| 特徵 | 類別 |
+|---|---|
+| `count_state` | 12 種球數（訓練時 30% 機率遮蔽） |
+| `base_out_state` | 壘包 × 出局，24 種 |
+| `matchup` | 右投右打、右投左打、左投右打、左投左打 |
+| `prev1_pa_result_class` | 前一打席結果：無、出局、三振、保送或觸身、一壘安打、長打 |
+
+#### 3. 刻意沒有放進模型的資訊
+
+| 資訊 | 原因 |
+|---|---|
+| 打者揮棒機制（揮棒速度、快速揮棒比例、揮棒長度、攻擊角） | 2024 年以後才有；train 年份的輪廓全是缺值，放進去會造成分布偏移。可用 `--use-bat-tracking` 開啟 |
+| 投手、打者、捕手的身分（ID） | 尚未加入 |
+| 轉軸角度 `spin_axis`、內外野佈陣 | preprocess 有保留，尚未放進模型 |
+| 身高、體重 | 好球帶正規化後幾乎沒有額外資訊 |
+| 本球的結果與初速 | 那是要預測的目標 |
+
 ### modeling/model.py
 `PitchSequenceModel`：
 - **序列**：每顆球 = 數值特徵投影 + 球種族 embedding + 打者反應 embedding + 位置 embedding，經過帶 padding mask 的 Transformer encoder
@@ -212,6 +315,30 @@ python -m pytest tests/                                  # 測試
 | 歷史消融 | 把前面的球換成別的打席的，AUC 掉多少、預測變多少：檢查模型有沒有真的用到序列 |
 
 test 只在模型定案後看，選模型、調參數一律看 val。
+
+### modeling/curves.py
+`python -m modeling.curves --run runs/<run> --split val|test`，輸出 `curves_<split>/`。
+
+**17 個問題**（每個都是二元判斷，在自己的母體上評估）：
+
+| 類別 | 問題 |
+|---|---|
+| A 七種事件 | 壞球、看好球、揮空、擦棒被捕、界外、弱擊、強擊（one-vs-rest，母體為所有球） |
+| B 三段式 | 揮棒、判好球\|沒揮棒、觸球\|揮棒、打進場\|觸球、強擊\|打進場 |
+| C 組合指標 | CSW（看好球 + 揮空）、好球、打進場、追打（母體：好球帶外）、好球帶內揮棒（母體：好球帶內） |
+
+**8 個分層維度**：全部、球種族、球數（第一球 / 投手領先 / 平手 / 打者領先 / 滿球數）、投打慣用手、本打席第幾球、好球帶內外、球季、打者類型（新人 / 老將）
+
+**門檻**：在 val 上取每個問題 F1 最大的門檻，存成 `runs/<run>/thresholds_val.json`；評估 test 時沿用這份門檻，不在 test 上調整。
+
+| 輸出 | 內容 |
+|---|---|
+| `metrics.csv` | 每列 = 問題 × 分組：樣本數、正例數、正例比例、平均預測、AUC、PR-AUC、PR-AUC 倍數、Brier、log loss、門檻、Precision、Recall、F1、Specificity、Accuracy、被標記比例、TP/FP/FN/TN |
+| `summary.md` | 17 個問題「全部」那一列的摘要表 |
+| `roc_overview.png` | 17 個問題的整體 ROC |
+| `roc_<問題>.png` | 單一問題，8 個分層維度各一格，同維度的分組疊在一起，並標出門檻的操作點 |
+
+分組樣本少於 200 時不計算 AUC 也不畫曲線。
 
 ### tests/
 | 檔案 | 檢查內容 |

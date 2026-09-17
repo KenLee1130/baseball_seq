@@ -96,6 +96,7 @@ CTX_BASE = ["inning", "outs_when_up", "n_runners", "lineup_slot", "nth_pa_vs_pit
 PROFILE_PREV = (
     ["prev_season_swing_rate", "prev_season_whiff_rate", "prev_season_chase_rate", "prev_season_bip_rate",
      "prev_season_hardhit_rate", "prev_season_pull_rate", "prev_season_ev"]
+    + [f"prev_season_hardhit_rate_{r}" for r in ("high", "mid", "low")]
     + [f"prev_season_{m}_{f}" for f in FAMILIES for m in ("chase_rate", "whiff_rate", "hardhit_rate", "ev")]
     + [f"prev_season_{m}_{f}_{r}" for f in FAMILIES for r in REGIONS for m in ("swing_rate", "whiff_rate")]
 )
