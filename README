@@ -20,10 +20,11 @@ baseball_seq/
   modeling/
     features.py          ✅ 把逐球資料轉成模型輸入張量              → dataset/splits/arrays/{年}/
     outcomes.py          ✅ 三段式預測 -> 場上事件、球數轉移、得分價值 → dataset/splits/run_values.json
-    model.py             ⬜ 尚未建立
-    train.py             ⬜ 尚未建立
-    evaluate.py          ⬜ 尚未建立
-  configs/               ⬜ 每個實驗一個 yaml
+    model.py             ✅ Transformer 序列模型，輸出 7 類事件機率
+    train.py             ✅ 依 config 訓練，輸出到 runs/<名稱>_<時間>/
+    evaluate.py          ✅ 整體、三段式、分層、校準、歷史消融
+  configs/
+    event7_base.yaml     ✅ 基準實驗設定
   analysis/
     counterfactual.py    ⬜ 尚未建立
   tests/                 ✅ 資料洩漏與特徵一致性的測試
@@ -42,8 +43,10 @@ python data_preparation/fetch_data.py --season all       # 1. 下載 (約 1.9 GB
 python data_preparation/preprocess.py --season all       # 2. 逐季前處理 (每季約 8 秒)
 python data_preparation/batter_profile.py --season all   # 3. 打者輪廓 (全部約 20 秒)
 python data_preparation/splits.py                        # 4. 檢查切分、輸出分布比較
-python -m modeling.features --fit --build                # 5. 標準化參數 + 張量快取 (約 1 分鐘，6.9 GB)
+python -m modeling.features --fit --build                # 5. 標準化參數 + 張量快取 (約 1.5 分鐘，11 GB)
 python -m modeling.outcomes --fit                        # 6. 各球數 x 事件的得分價值表 (只用 train)
+python -m modeling.train --config configs/event7_base.yaml         # 7. 訓練 (結束後自動在 val 上評估)
+python -m modeling.evaluate --run runs/<run> --split test          # 8. 模型定案後才在 test 上評估
 
 python -m pytest tests/                                  # 測試
 ```
@@ -128,18 +131,20 @@ python -m pytest tests/                                  # 測試
 
 | 張量 | 形狀 | 內容 |
 |---|---|---|
-| `token_num` | [N, 6, 22] | 最近 6 顆球（本球在最後一格）：物理量、與前一球的差異、歷史球初速、旗標 |
-| `token_cat` | [N, 6, 2] | 球種族、打者反應（本球的反應被遮蔽成 `<mask>`） |
-| `pad` | [N, 6] | 打席不足 6 球時的補位 |
+| `token_num` | [N, 21, 22] | **本打席**第 1 球到本球（本球在最後一格，不足 21 球的在前面補位）：物理量、與前一球的差異、歷史球初速、旗標 |
+| `token_cat` | [N, 21, 2] | 球種族、打者反應（本球的反應被遮蔽成 `<mask>`） |
+| `pad` | [N, 21] | 補位遮罩：第 N 球的樣本只有最後 N 格是真的球 |
 | `ctx_num` | [N, 101] | 情境、上一季輪廓、近期拉打率、新人旗標 |
-| `ctx_cat` | [N, 4] | 球數、base-out 狀態、左右對戰、前一打席結果 |
+| `ctx_cat` | [N, 4] | 球數、base-out 狀態、投打慣用手組合 (RHP_RHB / RHP_LHB / LHP_RHB / LHP_LHB)、前一打席結果 |
 | 標籤 | [N] | `y_swing`、`y_contact` + `m_contact`、`y_ev` + `m_ev`、`y_contact3` + `m_contact3`（`m_*` 是各段的母體遮罩） |
 
 - **差異特徵在窗口內即時計算**，不讀 preprocess 的 `prev1_*` 欄位。反事實替換某一顆球後，下一顆球的速差、tunnel ratio 會自動更新
 - **標準化參數只從 train 估計**，存在 `dataset/splits/normalizer.json`，val / test / 反事實一律載入同一份；缺值標準化後填 0
 - **類別詞彙寫死在程式裡**，不從資料學，確保各切分編碼一致
 - **揮棒機制特徵預設不使用**：train 年份的輪廓來源都沒有 bat tracking，放進去會造成 val / test 才突然有值的分布偏移。需要時加 `--use-bat-tracking`
-- 快取：每季一個資料夾 `dataset/splits/arrays/{年}/`，每個張量一個 `.npy`，用 `load_cached()` 以 mmap 讀取
+- **序列只含同一打席**：第 N 球的序列就是本打席第 1 到第 N 球，不會混入前一個打席。2015-2026 最長的打席是 21 球，所以窗口開到 21，沒有任何打席被截斷
+- **投打慣用手明確給出**：位置與位移特徵已翻成打者視角，另外用 4 類 `matchup` 告訴模型實際的投手與打者慣用手
+- 快取：每季一個資料夾 `dataset/splits/arrays/{年}/`，每個張量一個 `.npy` (`token_num` 存 float16)，用 `load_cached()` 以 mmap 讀取，全部約 11 GB
 
 ### modeling/outcomes.py
 把三段式預測對應到場上實際發生的事件，是模型輸出和「配球好不好」之間的橋樑。
@@ -171,6 +176,43 @@ python -m pytest tests/                                  # 測試
 - `event_label()`：Statcast description -> 事件名稱
 - `fit_run_values()`：從 train 估計每個 (球數, 事件) 的平均 `delta_run_exp`，讓不同結果能放在同一把尺上比較，例如 0-0 強擊 +0.292、3-2 看好球 -0.331
 
+### 預測目標：7 類事件
+模型不分段訓練，而是直接輸出每一球 7 類事件的機率 (softmax)：
+`壞球、好球、揮空、擦棒被捕、界外、弱擊 (打進場 ≤95 mph)、強擊 (打進場 >95 mph)`
+
+- 三段式的條件機率都可以從這 7 個機率換算，例如 `P(揮棒) = 揮空 + 擦棒 + 界外 + 弱擊 + 強擊`、`P(強擊 | 打進場) = 強擊 / (弱擊 + 強擊)`
+- 強擊只看**打進場**的球，不用「觸球上的初速迴歸」：界外球初速在早期年份覆蓋率很低，而且配球決策在乎的是打進場的強擊
+- 觸擊、觸身球、打進場但缺初速的球不當標籤 (`m_event = False`)
+
+### modeling/model.py
+`PitchSequenceModel`：
+- **序列**：每顆球 = 數值特徵投影 + 球種族 embedding + 打者反應 embedding + 位置 embedding，經過帶 padding mask 的 Transformer encoder
+- **摘要**：本球的表示 + 整段序列的 attention pooling
+- **情境**：數值特徵投影 + 球數、壘包出局、投打慣用手組合、前一打席結果的 embedding
+- **輸出**：MLP -> 7 個 logits
+
+### modeling/train.py
+`python -m modeling.train --config configs/xxx.yaml`
+- 讀 features 的快取張量 (train 2016-2023、val 2024)，整份放上 GPU
+- AdamW + bfloat16 混合精度；val loss 沒進步時學習率減半，連續 `patience` 次沒進步就停
+- `count_dropout`：訓練時隨機把球數換成 `<pad>`，逼模型從序列讀資訊
+- 輸出 `runs/<名稱>_<時間>/`：`config.yaml` (含特徵設定與切分)、`normalizer.json`、`model.pt` (val 最佳)、`history.jsonl`、`train.log`
+- 訓練結束自動在 val 上跑 `evaluate.py`
+
+### modeling/evaluate.py
+`python -m modeling.evaluate --run runs/<run> --split val|test`，輸出 `eval_<split>/metrics.json` 與 `report.md`：
+
+| 項目 | 內容 |
+|---|---|
+| 整體 | 7 類 log loss，和「只用類別比例猜」的基準比較 |
+| 各事件 | one-vs-rest AUC、PR-AUC、平均預測 vs 實際 |
+| 三段式 | 揮棒、判好球\|沒揮棒、觸球\|揮棒、打進場\|觸球、強擊\|打進場、強擊 (所有球)，各在自己的母體上評估 |
+| 分層 | 強擊與揮棒，依球種族、球數、投打慣用手組合、本打席第幾球分組 |
+| 校準 | 強擊與揮棒的十分位校準表 |
+| 歷史消融 | 把前面的球換成別的打席的，AUC 掉多少、預測變多少：檢查模型有沒有真的用到序列 |
+
+test 只在模型定案後看，選模型、調參數一律看 val。
+
 ### tests/
 | 檔案 | 檢查內容 |
 |---|---|
@@ -186,4 +228,5 @@ python -m pytest tests/                                  # 測試
 - **揮棒機制只有 2024 年以後**，所以只有 2025 年以後的上一季輪廓有值，目前 train 用不到
 - **2020 年短球季**只有約 26 萬球
 - **2026 年資料到 2026-09-15**，併入 test
+- **環境**：`requirements.txt` 的 PyTorch 是 CUDA 12.1 版本，換機器時要依驅動版本調整
 - **`tunnel_ratio` 分布右偏**（平均 10.4、標準差 8.4），建模時可考慮先取 log

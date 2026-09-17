@@ -56,8 +56,9 @@ def test_step_conserves_probability():
 
 def test_event_label_mapping():
     desc = pd.Series(["blocked_ball", "swinging_strike_blocked", "foul_tip", "hit_into_play",
-                      "hit_into_play", "foul_bunt"])
-    ls = pd.Series([np.nan, np.nan, np.nan, 101.0, 80.0, np.nan])
+                      "hit_into_play", "foul_bunt", "hit_into_play"])
+    ls = pd.Series([np.nan, np.nan, np.nan, 101.0, 80.0, np.nan, np.nan])
     labels = O.event_label(desc, ls)
     assert labels.iloc[:5].tolist() == ["ball", "whiff", "foul_tip", "in_play_hard", "in_play_soft"]
     assert pd.isna(labels.iloc[5])                      # 觸擊不在事件樹內
+    assert pd.isna(labels.iloc[6])                      # 打進場缺初速：不可當成弱擊

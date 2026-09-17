@@ -1,7 +1,12 @@
+# PyTorch 使用 CUDA 12.1 版本 (本機驅動支援到 CUDA 12.2)
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
 numpy==2.4.6
 pandas==3.0.5
 pyarrow==25.0.1
 pybaseball==2.2.7
-requests==2.34.2
-tqdm==4.70.0
 pytest==9.1.1
+pyyaml==6.0.3
+requests==2.34.2
+scikit-learn==1.9.1
+tqdm==4.70.0

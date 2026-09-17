@@ -92,15 +92,21 @@ def event_probs(p: StageProbs) -> dict[str, np.ndarray]:
 
 
 def event_label(description: pd.Series, launch_speed: pd.Series) -> pd.Series:
-    """把 Statcast description 對應到 EVENTS (觸擊與觸身球回傳 NaN，不在事件樹內)。"""
+    """把 Statcast description 對應到 EVENTS。
+
+    回傳 NaN 的情況 (不在事件樹內，不可當標籤)：
+      - 觸擊、觸身球
+      - 打進場但沒有初速：無法判斷強弱，不可默默當成弱擊
+    """
+    bip = description == "hit_into_play"
     return pd.Series(np.select(
         [description.isin(["ball", "blocked_ball"]),
          description == "called_strike",
          description.isin(["swinging_strike", "swinging_strike_blocked"]),
          description == "foul_tip",
          description == "foul",
-         (description == "hit_into_play") & (launch_speed > HARD_HIT_MPH),
-         description == "hit_into_play"],
+         bip & (launch_speed > HARD_HIT_MPH),
+         bip & launch_speed.notna()],
         ["ball", "called_strike", "whiff", "foul_tip", "foul", "in_play_hard", "in_play_soft"],
         default=None,
     ), index=description.index)

@@ -1,0 +1,20 @@
+# 7 類事件模型的基準設定
+name: event7_base
+
+model:
+  d_model: 128
+  n_heads: 4
+  n_layers: 3
+  dropout: 0.1
+  ctx_cat_dim: 16
+
+train:
+  batch_size: 4096
+  lr: 0.001
+  weight_decay: 0.0001
+  max_epochs: 30
+  patience: 3              # val loss 連續幾個 epoch 沒進步就停
+  min_delta: 0.0002
+  count_dropout: 0.3       # 訓練時隨機遮蔽球數，逼模型從序列讀資訊
+  seed: 42
+  device: cuda:0

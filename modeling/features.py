@@ -5,12 +5,12 @@ features.py
 不得在別處重寫特徵建構 (舊專案曾因反事實腳本自己重建特徵而用錯座標)。
 
 每一個樣本 = 一顆「可當目標」的球，輸入包含：
-  token_num  [N, L, F]  最近 L 顆球 (含本球) 的數值特徵，本球在最後一格
+  token_num  [N, L, F]  本打席第 1 球到本球的數值特徵 (只含同一打席)，本球在最後一格
   token_cat  [N, L, 2]  球種族、打者反應 (本球的反應被遮蔽)
   pad        [N, L]     True = 補位 (打席的球不足 L 顆)
   ctx_num    [N, G]     情境與打者輪廓的數值特徵
-  ctx_cat    [N, K]     球數、壘包出局、左右對戰、前一打席結果
-  標籤與遮罩            三段式目標 + 三類擊球，各有自己的母體遮罩
+  ctx_cat    [N, K]     球數、壘包出局、投打慣用手組合、前一打席結果
+  標籤與遮罩            主目標 y_event (7 類事件，見 outcomes.EVENTS)；另保留三段式與三類擊球供對照
 
 設計原則：
   1. 前後球的差異 (速差、位置差、tunneling) 在這裡由窗口內相鄰的球即時計算，
@@ -43,9 +43,12 @@ sys.path.insert(0, str(ROOT / "data_preparation"))
 
 import data_spec as spec          # noqa: E402
 import splits as sp               # noqa: E402
+from modeling.outcomes import EVENTS, event_label  # noqa: E402
 from batter_profile import FAMILIES, REGIONS  # noqa: E402
 
-SEQ_LEN = 6
+# 序列 = 本打席從第 1 球到本球。2015-2026 最長的打席是 21 球，所以窗口開到 21，
+# 所有打席都不會被截斷；較短的打席在前面補位 (pad = True)。
+SEQ_LEN = 21
 PA_KEY = ["game_pk", "at_bat_number"]
 
 # ---------------------------------------------------------------------------
@@ -58,7 +61,8 @@ FAMILY_VOCAB = [PAD, *FAMILIES, "other"]
 OUTCOME_VOCAB = [PAD, MASK, "ball", "called_strike", "whiff", "foul", "in_play", "hbp", "other"]
 COUNT_VOCAB = [PAD] + [f"{b}-{s}" for b in range(4) for s in range(3)]
 BASE_OUT_VOCAB = [PAD] + [str(i) for i in range(24)]
-PLATOON_VOCAB = [PAD, "same", "opposite"]
+# 投手慣用手 x 打者本打席站位 (左右開弓者依實際站位)
+MATCHUP_VOCAB = [PAD, "RHP_RHB", "RHP_LHB", "LHP_RHB", "LHP_LHB"]
 PREV_PA_VOCAB = [PAD, "none", "out", "k", "bb_hbp", "single", "xbh"]
 
 CAT_VOCABS = {
@@ -66,7 +70,7 @@ CAT_VOCABS = {
     "pitch_outcome": OUTCOME_VOCAB,
     "count_state": COUNT_VOCAB,
     "base_out_state": BASE_OUT_VOCAB,
-    "platoon": PLATOON_VOCAB,
+    "matchup": MATCHUP_VOCAB,
     "prev1_pa_result_class": PREV_PA_VOCAB,
 }
 
@@ -101,16 +105,7 @@ PROFILE_BAT_TRACKING = ["prev_season_mean_bat_speed", "prev_season_fast_swing_ra
                         "prev_season_mean_swing_length", "prev_season_mean_attack_angle"]
 PROFILE_RECENT = ["recent_pull_rate"] + [f"recent_pull_rate_{f}" for f in FAMILIES]
 CTX_FLAGS = ["is_rookie", "recent_window_sufficient"]
-CTX_CAT = ["count_state", "base_out_state", "platoon", "prev1_pa_result_class"]
-
-LABELS = {
-    # 名稱: (欄位, 母體遮罩的產生方式)
-    "y_swing": "is_swing",
-    "y_contact": "is_contact",
-    "y_ev": "ev_measured",
-    "y_contact3": "contact3",
-}
-
+CTX_CAT = ["count_state", "base_out_state", "matchup", "prev1_pa_result_class"]
 
 @dataclass
 class FeatureConfig:
@@ -141,9 +136,9 @@ def input_columns(cfg: FeatureConfig) -> list[str]:
     raw = ["game_date", "game_pk", "at_bat_number", "pitch_number", "pitcher", "batter", "stand", "p_throws",
            "plate_x_bv", "plate_z_norm", "release_speed", "effective_speed", "speed_vs_own_fastball",
            "pfx_x_bv", "pfx_z", "release_spin_rate", "release_extension", "release_pos_x", "release_pos_z",
-           "pitch_family", "pitch_outcome", "ev_measured", "is_model_target",
+           "pitch_family", "pitch_outcome", "ev_measured", "is_model_target", "description", "launch_speed",
            "is_swing", "is_contact", "contact3", "count_state", "base_out_state",
-           "prev1_pa_result_class"] + CTX_BASE
+           "prev1_pa_result_class", "zone"] + CTX_BASE
     return list(dict.fromkeys(raw))
 
 
@@ -152,7 +147,7 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     side = np.where(df["stand"] == "L", -1.0, 1.0)
     df["release_pos_x_bv"] = df["release_pos_x"] * side
-    df["platoon"] = np.where(df["stand"] == df["p_throws"], "same", "opposite")
+    df["matchup"] = df["p_throws"].astype(str) + "HP_" + df["stand"].astype(str) + "HB"
     df["prev1_pa_result_class"] = df["prev1_pa_result_class"].fillna("none")
     df["base_out_state"] = df["base_out_state"].astype("Int64").astype(str).replace("<NA>", PAD)
     df["bat_score_diff"] = df["bat_score_diff"].clip(-10, 10)
@@ -257,7 +252,11 @@ def build_arrays(df: pd.DataFrame, norm: Normalizer, cfg: FeatureConfig,
     pos = df.groupby(PA_KEY, sort=False).cumcount().to_numpy()
     targets = np.flatnonzero(target_mask)
 
-    # 窗口索引：最後一格是目標球本身，往前取同打席的球
+    too_long = int((pos[targets] >= L).sum())
+    if too_long:
+        log(f"  ! {too_long} 個樣本所在打席超過 {L} 球，只保留最近 {L} 球")
+
+    # 窗口索引：最後一格是目標球本身，往前取同打席的球 (pos 是本打席內的序號，所以不會跨打席)
     offsets = np.arange(L - 1, -1, -1)
     idx = targets[:, None] - offsets[None, :]
     valid = pos[targets][:, None] >= offsets[None, :]
@@ -291,7 +290,12 @@ def build_arrays(df: pd.DataFrame, norm: Normalizer, cfg: FeatureConfig,
     ctx_cat = np.stack([encode_cat(t[c], CAT_VOCABS[c]) for c in CTX_CAT], axis=1)
 
     # -- 標籤與母體遮罩 --
+    event = event_label(t["description"], t["launch_speed"])
+    event_index = {e: i for i, e in enumerate(EVENTS)}
     labels = {
+        # 主目標：7 類事件。觸擊、觸身球、打進場缺初速者 m_event = False
+        "y_event": event.map(event_index).fillna(0).to_numpy(np.int64),
+        "m_event": event.notna().to_numpy(bool),
         "y_swing": t["is_swing"].to_numpy(np.float32),
         "y_contact": t["is_contact"].to_numpy(np.float32),
         "m_contact": t["is_swing"].to_numpy(bool),                 # Stage 2 母體：有揮棒
@@ -300,7 +304,10 @@ def build_arrays(df: pd.DataFrame, norm: Normalizer, cfg: FeatureConfig,
         "y_contact3": t["contact3"].clip(lower=0).to_numpy(np.int64),
         "m_contact3": (t["contact3"] >= 0).to_numpy(bool),         # 打進場缺初速者排除
     }
+    # meta 不進模型，只供評估分層與追查樣本
     meta = {k: t[k].to_numpy() for k in ["game_pk", "at_bat_number", "pitch_number", "pitcher", "batter"]}
+    meta["zone"] = t["zone"].fillna(0).to_numpy(np.int8)                 # Savant zone：1-9 好球帶內、11-14 帶外
+    meta["is_rookie"] = t["is_rookie"].astype(bool).to_numpy() if "is_rookie" in t else np.zeros(len(t), bool)
 
     return {"token_num": token_num, "token_cat": token_cat, "pad": ~valid,
             "ctx_num": ctx_num.astype(np.float32), "ctx_cat": ctx_cat, **labels,
@@ -330,7 +337,8 @@ def build_cache(cfg: FeatureConfig, norm: Normalizer) -> None:
             out = ARRAY_DIR / str(season)
             out.mkdir(parents=True, exist_ok=True)
             for k, v in arrays.items():
-                np.save(out / f"{k}.npy", v)
+                # 序列張量改存 float16：21 格序列下可省一半空間，讀取時再轉回 float32
+                np.save(out / f"{k}.npy", v.astype(np.float16) if k == "token_num" else v)
             (out / "info.json").write_text(json.dumps({
                 "season": season, "split": name, "n_samples": int(len(arrays["ctx_num"])),
                 "feature_config": cfg.to_dict(), "feature_names": feature_names(cfg),

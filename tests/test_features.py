@@ -40,6 +40,7 @@ def make_df(pa_lengths, speeds=None):
                 "speed_vs_own_fastball": speed - 95.0, "pfx_x_bv": 0.3, "pfx_z": 1.0, "release_spin_rate": 2300.0,
                 "release_extension": 6.5, "release_pos_x": -2.0, "release_pos_z": 6.0,
                 "pitch_family": "fastball", "pitch_outcome": "foul" if p < n else "in_play",
+                "description": "foul" if p < n else "hit_into_play", "launch_speed": 88.0 if p < n else 101.0,
                 "ev_measured": 88.0 if p < n else 101.0, "is_model_target": True, "use_as_target": True,
                 "is_swing": True, "is_contact": True, "contact3": 2 if p == n else 0,
                 "count_state": "0-0", "base_out_state": 0, "prev1_pa_result_class": None,
@@ -57,13 +58,33 @@ def identity_normalizer():
 def test_window_does_not_cross_pa_and_masks_target():
     arr = F.build_arrays(make_df([3, 2]), identity_normalizer(), CFG)
     assert arr["token_num"].shape == (5, CFG.seq_len, len(F.TOKEN_NUM))
-    # 第二個打席的第一球：只有自己一顆，前面全是補位
-    assert arr["pad"][3].tolist() == [True] * 5 + [False]
-    assert arr["pad"][2].tolist() == [True] * 3 + [False] * 3
+    L = CFG.seq_len
+    # 序列只含同一打席：第二個打席的第一球只有自己一顆；第一個打席的第 3 球有 3 顆
+    assert arr["pad"][3].tolist() == [True] * (L - 1) + [False]
+    assert arr["pad"][2].tolist() == [True] * (L - 3) + [False] * 3
+    assert arr["pad"][4].tolist() == [True] * (L - 2) + [False] * 2
     assert (arr["token_cat"][:, -1, 1] == F.OUTCOME_VOCAB.index(F.MASK)).all()
     ev = F.TOKEN_NUM.index("ev_measured")
     assert (arr["token_num"][:, -1, ev] == 0).all()        # 本球初速被遮蔽
     assert arr["token_num"][2, -2, ev] == pytest.approx(88.0)  # 歷史球保留
+
+
+def test_long_pa_keeps_every_pitch():
+    n = 12
+    arr = F.build_arrays(make_df([n]), identity_normalizer(), CFG)
+    assert (~arr["pad"][-1]).sum() == n                     # 第 12 球的序列包含第 1 到第 12 球
+    speed = F.TOKEN_NUM.index("release_speed")
+    assert arr["token_num"][-1, -n, speed] == pytest.approx(91.0)  # 最前面是本打席第 1 球
+
+
+def test_matchup_uses_both_hands():
+    df = make_df([1, 1, 1, 1])
+    df["p_throws"] = ["R", "R", "L", "L"]
+    df["stand"] = ["R", "L", "R", "L"]
+    arr = F.build_arrays(df, identity_normalizer(), CFG)
+    slot = F.CTX_CAT.index("matchup")
+    names = [F.MATCHUP_VOCAB[i] for i in arr["ctx_cat"][:, slot]]
+    assert names == ["RHP_RHB", "RHP_LHB", "LHP_RHB", "LHP_LHB"]
 
 
 def test_diffs_follow_counterfactual_replacement():
@@ -100,6 +121,15 @@ def test_label_masks():
     assert arr["m_contact"].tolist() == [False, True]
     assert arr["m_ev"].tolist() == [False, True]
     assert arr["m_contact3"].tolist() == [True, False]
+
+
+def test_event_label_and_mask():
+    df = make_df([3])
+    df.loc[1, ["description", "launch_speed", "ev_measured"]] = ["swinging_strike", np.nan, np.nan]
+    df.loc[2, "launch_speed"] = np.nan                     # 打進場但缺初速
+    arr = F.build_arrays(df, identity_normalizer(), CFG)
+    assert arr["y_event"][:2].tolist() == [F.EVENTS.index("foul"), F.EVENTS.index("whiff")]
+    assert arr["m_event"].tolist() == [True, True, False]
 
 
 def test_target_mask_limits_samples_but_keeps_context():
