@@ -1,3 +1,7 @@
 /.venv
 /data_preparation/__pycache__
 /data_preparation/dataset
+# 訓練輸出與快取
+/runs
+__pycache__/
+.pytest_cache/

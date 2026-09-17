@@ -1,0 +1,19 @@
+文件結構：
+baseball_seq/
+  data_preparation/
+    data_spec.py         已有：規格
+    fetch_data.py        已有：下載
+    preprocess.py        清洗、衍生特徵、標籤 → dataset/interim/pitches_{年}.parquet
+    batter_profile.py    上一季輪廓 + 近 30 天滾動 → dataset/interim/batter_profile_{年}.parquet
+    splits.py            依球季切分：例如 train 2016-2023 / val 2024 / test 2025
+  modeling/
+    features.py          把一個打席轉成模型輸入（訓練和反事實共用同一份）
+    model.py
+    train.py             python -m modeling.train --config configs/xxx.yaml
+    evaluate.py          整體 + 分層 + 校準 + 歷史消融，每次訓練自動跑
+  configs/               每個實驗一個 yaml
+  analysis/
+    counterfactual.py
+  tests/                 資料洩漏與特徵一致性的測試
+  runs/                  每次訓練的輸出（不進 git）
+
