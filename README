@@ -1,19 +1,157 @@
-文件結構：
+# baseball_seq
+
+研究問題：打者可以依「對球的反應」分群；對每一群，找出最有效的配球「序列」
+（不只是單一球種或位置，而是前幾球怎麼鋪陳）。
+
+資料來源是 2015-2026 年 MLB Statcast 逐球資料。
+
+
+## 文件結構
+
+```
 baseball_seq/
   data_preparation/
-    data_spec.py         已有：規格
-    fetch_data.py        已有：下載
-    preprocess.py        清洗、衍生特徵、標籤 → dataset/interim/pitches_{年}.parquet
-    batter_profile.py    上一季輪廓 + 近 30 天滾動 → dataset/interim/batter_profile_{年}.parquet
-    splits.py            依球季切分：例如 train 2016-2023 / val 2024 / test 2025
+    data_spec.py         ✅ 規格：要抓什麼、特徵怎麼算、目標怎麼定義（不做任何 I/O）
+    fetch_data.py        ✅ 下載 Statcast 與球員身高體重          → dataset/raw/
+    preprocess.py        ✅ 標籤、正規化、情境、序列特徵            → dataset/interim/pitches_{年}.parquet
+    batter_profile.py    ✅ 打者輪廓：上一季 + 近 30 天             → dataset/interim/batter_*_{年}.parquet
+    splits.py            ✅ 依球季切 train/val/test、定義預測目標   → dataset/splits/manifest.json
+    dataset/             資料（不進 git）
   modeling/
-    features.py          把一個打席轉成模型輸入（訓練和反事實共用同一份）
-    model.py
-    train.py             python -m modeling.train --config configs/xxx.yaml
-    evaluate.py          整體 + 分層 + 校準 + 歷史消融，每次訓練自動跑
-  configs/               每個實驗一個 yaml
+    features.py          ✅ 把逐球資料轉成模型輸入張量              → dataset/splits/arrays/{年}/
+    model.py             ⬜ 尚未建立
+    train.py             ⬜ 尚未建立
+    evaluate.py          ⬜ 尚未建立
+  configs/               ⬜ 每個實驗一個 yaml
   analysis/
-    counterfactual.py
-  tests/                 資料洩漏與特徵一致性的測試
+    counterfactual.py    ⬜ 尚未建立
+  tests/                 ✅ 資料洩漏與特徵一致性的測試
   runs/                  每次訓練的輸出（不進 git）
+```
 
+
+## 執行順序
+
+每一步都可以重跑；已完成的部分會跳過或覆寫，不會重複下載。
+
+```bash
+source .venv/bin/activate
+
+python data_preparation/fetch_data.py --season all       # 1. 下載 (約 1.9 GB，已下載的月份會跳過)
+python data_preparation/preprocess.py --season all       # 2. 逐季前處理 (每季約 8 秒)
+python data_preparation/batter_profile.py --season all   # 3. 打者輪廓 (全部約 20 秒)
+python data_preparation/splits.py                        # 4. 檢查切分、輸出分布比較
+python -m modeling.features --fit --build                # 5. 標準化參數 + 張量快取 (約 1 分鐘，6.9 GB)
+
+python -m pytest tests/                                  # 測試
+```
+
+
+## 各檔案做了什麼
+
+### data_preparation/data_spec.py
+整個專案的「單一事實來源」。只描述要什麼，不讀寫任何檔案。
+
+- 路徑、賽季範圍 (2015-2026)、各欄位從哪一年開始有資料 (`COLUMN_AVAILABILITY`)
+- 要保留的 Statcast 欄位與用途
+- 球種分族 (`PITCH_FAMILY`：16 種球種收斂成 6 族) 與要剔除的非競技球種
+- 三段式預測目標的精確定義：
+  - Stage 1 `P(揮棒)`
+  - Stage 2 `P(觸球 | 揮棒)`，界外球算觸球
+  - Stage 3 `擊球初速 | 觸球`
+- 衍生特徵的定義與防洩漏規則 (`DERIVED_FEATURES`)
+
+其他檔案的常數與規則都應該從這裡讀，不要各自寫一份。
+
+### data_preparation/fetch_data.py
+下載原始資料到 `dataset/raw/`。
+
+- **Statcast 逐球資料**：逐月下載、每月一個 parquet，再合併成年檔 `statcast_{年}.parquet`
+  - 已經完整的月份會跳過；沒有比賽的月份寫下 `.empty` 標記，之後不再查詢
+  - 整月查詢失敗時自動改成逐日下載
+- **球員資料** (`player_bio.parquet`)：身高、體重、慣用手、守備位置，來自 MLB Stats API
+- 只做最低限度的過濾：只留例行賽、剔除牽制等非競技投球
+
+### data_preparation/preprocess.py
+原始逐球資料 → `dataset/interim/pitches_{年}.parquet`（每季約 70 萬球、167 欄）。
+
+**不刪列、只標記**：直接刪掉觸擊或缺值的球，會讓後面的球找錯「前一球」，所以一律保留並加旗標。
+
+| 類別 | 內容 |
+|---|---|
+| 標籤 | 三段式 (`is_swing`、`is_contact`、`ev_measured`)；三類擊球 `contact3` (0 未打進場 / 1 弱擊 / 2 強擊 >95 mph / -1 打進場缺初速)；每球反應 `pitch_outcome` |
+| 正規化 | `plate_z_norm` (0 = 好球帶下緣、1 = 上緣)、`plate_x_norm`、**打者視角** `plate_x_bv` / `pfx_x_bv` (左打翻正，正 = 外角)、`in_zone` (Savant 官方 zone) |
+| 投手 | `speed_vs_own_fastball`：本球球速減投手速球均速，均速只用本場之前的比賽 |
+| 情境 | 12 類球數、壘包狀態、base-out 狀態、棒次、本場第幾次對這位投手、投手用球數 |
+| 打線脈絡 | 前 1-3 個打席的結果、是否上壘、本半局已面對幾位打者（只用嚴格更早的打席） |
+| 序列 | 前 1-3 球的特徵、速差、進壘點差、位移差、球種配對、出手點距離、tunnel ratio |
+| 品質旗標 | `pa_valid` (無缺值、無斷號、無觸擊)、`is_model_target` (可當預測目標) |
+
+棒次以「打者身分」推導，不是把打席編號 mod 9：只要有一個打席在資料裡沒有任何一球（例如不投球的故意四壞），mod 9 的作法會讓後面整場的棒次錯一格。
+
+### data_preparation/batter_profile.py
+打者輪廓，兩種時間基準、兩份輸出：
+
+**1. 上一季輪廓** `batter_prev_season_{年}.parquet`（一位打者一列，只讀前一年的資料）
+- 整體：揮棒率、揮空率、追打率、打進場率、強擊率、平均初速、拉打率
+- 揮棒機制：揮棒速度、快速揮棒比例 (≥75 mph)、揮棒長度、攻擊角。沒有 bat tracking 的年份是 NaN，不是 0
+- 6 個球種族各自的追打率、揮空率、強擊率、平均初速
+- 球種族 × 4 個區域 (好球帶上 / 中 / 下 / 追打區) 的揮棒率、揮空率
+- 一列 `batter = -1` 的聯盟平均，給沒有上一季資料的打者用
+
+**2. 近期輪廓** `batter_recent_{年}.parquet`（打者 × 比賽日）
+- 比賽日**之前** 30 天的拉打率，整體與各球種族
+- 窗口內揮棒不到 50 次時退回上一季值
+
+所有比率都向聯盟平均收縮，樣本越少越接近聯盟。
+`attach_batter_profile()` 負責合併到逐球資料：新人填聯盟平均並標記 `is_rookie`。
+
+### data_preparation/splits.py
+依**球季**切分，不隨機切（隨機切會讓同一季的球同時出現在 train 和 test）。
+
+| 切分 | 球季 | 用途 |
+|---|---|---|
+| train | 2016-2023 | 訓練（2015 沒有上一季輪廓，不納入） |
+| val | 2024 | 選超參數、early stopping |
+| test | 2025 | 最終評估，定案後只看一次 |
+| holdout | 2026 | 賽季進行中，僅供事後觀察 |
+
+- 不複製資料，只定義規則。`load_season()` 讀一季並合併打者輪廓；`iter_split()` 逐季讀取
+- `use_as_target`：`is_model_target` 且有上一季輪廓，並排除投手打擊（投手打擊的球仍保留在序列中當脈絡）
+- 執行時會檢查：季別不重疊、依時間先後、每季的打者輪廓只來自前一季；並輸出各切分的標籤分布比較
+
+### modeling/features.py
+把逐球資料轉成模型輸入張量。**訓練、評估、反事實分析都必須呼叫這一份**，不在別處重寫。
+
+每個樣本是一顆可當目標的球：
+
+| 張量 | 形狀 | 內容 |
+|---|---|---|
+| `token_num` | [N, 6, 22] | 最近 6 顆球（本球在最後一格）：物理量、與前一球的差異、歷史球初速、旗標 |
+| `token_cat` | [N, 6, 2] | 球種族、打者反應（本球的反應被遮蔽成 `<mask>`） |
+| `pad` | [N, 6] | 打席不足 6 球時的補位 |
+| `ctx_num` | [N, 101] | 情境、上一季輪廓、近期拉打率、新人旗標 |
+| `ctx_cat` | [N, 4] | 球數、base-out 狀態、左右對戰、前一打席結果 |
+| 標籤 | [N] | `y_swing`、`y_contact` + `m_contact`、`y_ev` + `m_ev`、`y_contact3` + `m_contact3`（`m_*` 是各段的母體遮罩） |
+
+- **差異特徵在窗口內即時計算**，不讀 preprocess 的 `prev1_*` 欄位。反事實替換某一顆球後，下一顆球的速差、tunnel ratio 會自動更新
+- **標準化參數只從 train 估計**，存在 `dataset/splits/normalizer.json`，val / test / 反事實一律載入同一份；缺值標準化後填 0
+- **類別詞彙寫死在程式裡**，不從資料學，確保各切分編碼一致
+- **揮棒機制特徵預設不使用**：train 年份的輪廓來源都沒有 bat tracking，放進去會造成 val / test 才突然有值的分布偏移。需要時加 `--use-bat-tracking`
+- 快取：每季一個資料夾 `dataset/splits/arrays/{年}/`，每個張量一個 `.npy`，用 `load_cached()` 以 mmap 讀取
+
+### tests/
+| 檔案 | 檢查內容 |
+|---|---|
+| `test_preprocess.py` | 標籤定義、左打翻正、速球均速不偷看當天、棒次缺打席時自動校正、打線脈絡不含本打席、序列不跨打席、斷號與觸擊整個打席標為無效 |
+| `test_batter_profile.py` | 上一季輪廓只讀前一年、30 天窗口排除當天與更早的比賽、樣本不足時退回、無 bat tracking 為 NaN、新人填聯盟平均、拉打方向 |
+| `test_features.py` | 窗口不跨打席、本球被遮蔽、反事實替換後差異特徵跟著更新、缺值填 0、標籤遮罩、切分必須依時間且不重疊 |
+
+
+## 已知限制
+
+- **2015-2016 年界外球初速覆蓋率很低**（2015 年約 21%，2024 年以後約 88%）。Stage 3 若包含界外球，早期球季的樣本會少很多且不是隨機缺失；三類擊球標籤只看打進場的球，不受影響
+- **揮棒機制只有 2024 年以後**，所以只有 2025 年以後的上一季輪廓有值，目前 train 用不到
+- **2020 年短球季**只有約 26 萬球
+- **2026 年賽季進行中**，資料到 2026-09-15
+- **`tunnel_ratio` 分布右偏**（平均 10.4、標準差 8.4），建模時可考慮先取 log
