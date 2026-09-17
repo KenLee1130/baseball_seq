@@ -15,11 +15,22 @@ fetch_data.py
   - 只做兩件過濾：非例行賽、非競技投球 (牽制、故意四壞)。
     其餘過濾 (觸擊、揮棒母體) 留到 preprocess，因為那牽涉建模決策。
 
+不重複下載的三層機制 (抓 2015-2026 共 12 季時，這點決定能不能重跑)：
+  1. 已定版的月檔直接跳過。「定版」= 該月已結束，且檔案寫於該月結束之後。
+     只檢查檔案存在是不夠的：賽季進行中抓下來的當月檔案只有半個月的球，
+     之後必須重抓，否則那個月永遠殘缺。
+  2. 確認無比賽的月份寫下 .empty 標記，之後不再向 Savant 查詢。
+     休賽期的月份在 12 季裡有數十個，每次都問一遍很浪費。
+  3. 年檔只在該季的月檔真的有變動時才重新合併。
+
 用法:
-    python fetch_data.py --smoke              # 3 天資料，驗證管線
-    python fetch_data.py --season model       # 只抓 2025
-    python fetch_data.py --season all         # 抓 2024 + 2025 (約 150 萬球)
-    python fetch_data.py --season all --force # 忽略既有檔案重抓
+    python fetch_data.py --smoke                # 3 天資料，驗證管線
+    python fetch_data.py --season all           # 2015-2026 全部 (預設)
+    python fetch_data.py --season 2019          # 單季
+    python fetch_data.py --season 2015-2020     # 區間
+    python fetch_data.py --season 2024,2025     # 列舉
+    python fetch_data.py --season all --report  # 每季印完整性檢查
+    python fetch_data.py --season 2020 --force  # 忽略既有檔案重抓該季
 """
 
 from __future__ import annotations
@@ -113,25 +124,101 @@ def _basic_filter(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def fetch_statcast_chunk(label: str, start: str, end: str, force: bool) -> Path | None:
-    """抓一個月的逐球資料，存成 parquet。已存在則跳過。"""
-    out = spec.RAW_DIR / f"statcast_{label}.parquet"
-    if out.exists() and not force:
-        log(f"  跳過 {label} (已存在, {out.stat().st_size / 1e6:.1f} MB)")
-        return out
+def _statcast_range(start: str, end: str, retries: int = 2) -> pd.DataFrame | None:
+    """抓一個日期區間，失敗時退化成逐日抓。
 
+    為什麼需要退化：實測 2015-04 整月查詢會拋
+    "Error tokenizing data. C error: Expected 1 fields in line 12, saw 2"，
+    但那個月裡每一天單獨抓都成功。表示問題出在 Savant 對大區間的回應
+    偶發截斷，不是資料本身缺失。整季直接放棄太可惜，逐日重試即可救回。
+
+    逐日模式慢得多 (一個月 30 次請求)，所以只在整區間失敗後才啟用。
+    """
     from pybaseball import statcast
+
+    for attempt in range(retries):
+        try:
+            return statcast(start_dt=start, end_dt=end, verbose=False)
+        except Exception as exc:  # noqa: BLE001
+            log(f"    區間查詢失敗 (第 {attempt + 1}/{retries} 次): {str(exc)[:80]}")
+            time.sleep(2 * (attempt + 1))
+
+    log("    改為逐日抓取")
+    cur = date.fromisoformat(start)
+    stop = date.fromisoformat(end)
+    frames: list[pd.DataFrame] = []
+    failed: list[str] = []
+    while cur <= stop:
+        day = cur.isoformat()
+        try:
+            d = statcast(start_dt=day, end_dt=day, verbose=False)
+            if d is not None and not d.empty:
+                frames.append(d)
+        except Exception:  # noqa: BLE001
+            failed.append(day)
+        cur += timedelta(days=1)
+
+    if failed:
+        # 明確報出來。靜靜吞掉缺天會讓序列特徵在該日斷裂而不自知。
+        log(f"    ! 逐日模式仍有 {len(failed)} 天失敗: {failed[:5]}{' ...' if len(failed) > 5 else ''}")
+    if not frames:
+        return None
+    return pd.concat(frames, ignore_index=True)
+
+
+def _chunk_is_fresh(out: Path, chunk_end: str, today: date) -> bool:
+    """判斷既有的月檔是否已經是「定版」，可以安全跳過。
+
+    只看檔案存在是不夠的：若某個月在賽季進行中就抓下來，
+    當時只有到抓取當天為止的比賽，之後那個月又打了半個月的球。
+    直接跳過會讓那個月永遠殘缺。
+
+    規則：該月已經結束 (chunk_end < today)，且檔案是在該月結束之後才寫入的，
+    才算定版。否則視為過期，重抓。
+    """
+    if not out.exists():
+        return False
+    end = date.fromisoformat(chunk_end)
+    if end >= today:
+        return False  # 這個月還沒過完，資料必然不完整
+    written = date.fromtimestamp(out.stat().st_mtime)
+    return written > end
+
+
+def fetch_statcast_chunk(
+    label: str, start: str, end: str, force: bool, today: date | None = None
+) -> Path | None:
+    """抓一個月的逐球資料，存成 parquet。
+
+    跳過條件有兩種，都是為了「重複的不要下載」：
+      1. 已有定版的月檔 (見 _chunk_is_fresh)
+      2. 已有 .empty 標記，代表該月確認無比賽 (休賽期)，不必再問 Savant 一次
+    """
+    today = today or date.today()
+    out = spec.RAW_DIR / f"statcast_{label}.parquet"
+    empty_marker = spec.RAW_DIR / f"statcast_{label}.empty"
+
+    if not force:
+        if _chunk_is_fresh(out, end, today):
+            log(f"  跳過 {label} (已定版, {out.stat().st_size / 1e6:.1f} MB)")
+            return out
+        if empty_marker.exists():
+            log(f"  跳過 {label} (已知無比賽)")
+            return None
+        if out.exists():
+            log(f"  重抓 {label} (既有檔案可能殘缺: 抓取時該月尚未結束)")
 
     log(f"  下載 {label} ({start} ~ {end}) ...")
     t0 = time.time()
-    try:
-        df = statcast(start_dt=start, end_dt=end, verbose=False)
-    except Exception as exc:  # noqa: BLE001
-        log(f"  ! {label} 下載失敗: {exc}")
-        return None
+    df = _statcast_range(start, end)
 
     if df is None or df.empty:
-        log(f"  {label} 無資料 (可能是休賽期)，跳過")
+        # 只有當這個月已經完全過去，「沒有比賽」才是個永久事實，才值得標記。
+        if date.fromisoformat(end) < today:
+            empty_marker.write_text(f"no games {start}..{end}\n")
+            log(f"  {label} 無資料 (休賽期)，寫下標記，之後不再查詢")
+        else:
+            log(f"  {label} 無資料 (尚未開打)，不標記")
         return None
 
     df = _basic_filter(df)
@@ -141,31 +228,53 @@ def fetch_statcast_chunk(label: str, start: str, end: str, force: bool) -> Path 
     df = df.sort_values(["game_pk", "at_bat_number", "pitch_number"]).reset_index(drop=True)
 
     df.to_parquet(out, index=False)
+    empty_marker.unlink(missing_ok=True)  # 之前若誤標為空，現在有資料了
     log(f"  {label}: {len(df):,} 球, {time.time() - t0:.0f}s, -> {out.name}")
     return out
 
 
-def fetch_statcast_season(season_key: str, force: bool) -> pd.DataFrame:
-    """抓整季，回傳合併後的 DataFrame。"""
+def fetch_statcast_season(season_key: str, force: bool) -> Path | None:
+    """抓整季，合併成年檔，回傳年檔路徑。
+
+    刻意回傳路徑而非 DataFrame：抓 2015-2026 共 12 季時，
+    把每一季都留在記憶體裡會用掉數 GB。呼叫端需要時再自己讀。
+    """
     cfg = spec.SEASONS[season_key]
-    log(f"=== Statcast {season_key} 賽季 {cfg['year']} ({cfg['start']} ~ {cfg['end']}) ===")
+    year = cfg["year"]
+    log(f"=== Statcast {year} ({cfg['start']} ~ {cfg['end']}) ===")
+
+    today = date.today()
+    out = spec.RAW_DIR / f"statcast_{year}.parquet"
 
     paths: list[Path] = []
+    rebuilt = False
     for label, s, e in month_chunks(cfg["start"], cfg["end"]):
-        p = fetch_statcast_chunk(label, s, e, force)
-        if p is not None:
-            paths.append(p)
+        before = out.exists() and (spec.RAW_DIR / f"statcast_{label}.parquet").exists()
+        mtime_before = (
+            (spec.RAW_DIR / f"statcast_{label}.parquet").stat().st_mtime if before else None
+        )
+        pth = fetch_statcast_chunk(label, s, e, force, today)
+        if pth is not None:
+            paths.append(pth)
+            if mtime_before is None or pth.stat().st_mtime != mtime_before:
+                rebuilt = True
 
     if not paths:
-        raise RuntimeError(f"{season_key} 賽季沒有抓到任何資料")
+        log(f"  {year} 沒有任何月份有資料，跳過")
+        return None
 
-    df = pd.concat([pd.read_parquet(p) for p in paths], ignore_index=True)
-    df = df.sort_values(["game_date", "game_pk", "at_bat_number", "pitch_number"]).reset_index(drop=True)
+    # 年檔只在月檔真的有變動時才重建。否則 12 季每次都重寫近 100 MB 很浪費。
+    if out.exists() and not rebuilt and not force:
+        log(f"=== {year} 年檔已是最新，跳過合併 ({out.stat().st_size / 1e6:.0f} MB) ===")
+        return out
 
-    out = spec.RAW_DIR / f"statcast_{cfg['year']}.parquet"
+    df = pd.concat([pd.read_parquet(pth) for pth in paths], ignore_index=True)
+    df = df.sort_values(
+        ["game_date", "game_pk", "at_bat_number", "pitch_number"]
+    ).reset_index(drop=True)
     df.to_parquet(out, index=False)
-    log(f"=== {cfg['year']} 合併完成: {len(df):,} 球, {df.game_pk.nunique():,} 場 -> {out.name} ===")
-    return df
+    log(f"=== {year} 合併完成: {len(df):,} 球, {df.game_pk.nunique():,} 場 -> {out.name} ===")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -288,15 +397,80 @@ def sanity_report(df: pd.DataFrame) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+def resolve_seasons(arg: str) -> list[str]:
+    """把 --season 的值解析成年份清單。
+
+    支援四種寫法，因為抓 12 季時常常只想補其中幾季：
+        all          全部 (2015-2026)
+        2019         單季
+        2019-2022    連續區間 (含頭含尾)
+        2019,2023    逗號列舉
+        profile/model 語意別名 (見 data_spec.SEASON_ALIASES)
+    """
+    arg = arg.strip()
+    if arg == "all":
+        return sorted(spec.SEASONS)
+    if arg in spec.SEASON_ALIASES:
+        return [spec.SEASON_ALIASES[arg]]
+
+    out: list[str] = []
+    for part in arg.split(","):
+        part = part.strip()
+        if part in spec.SEASON_ALIASES:
+            out.append(spec.SEASON_ALIASES[part])
+        elif "-" in part:
+            lo, hi = part.split("-", 1)
+            out.extend(str(y) for y in range(int(lo), int(hi) + 1))
+        else:
+            out.append(part)
+
+    unknown = [y for y in out if y not in spec.SEASONS]
+    if unknown:
+        raise SystemExit(
+            f"未知的賽季 {unknown}；可用範圍 "
+            f"{spec.FIRST_STATCAST_YEAR}-{spec.LAST_SEASON_YEAR}"
+        )
+    return sorted(dict.fromkeys(out))
+
+
+def collect_player_ids(paths: list[Path]) -> list[int]:
+    """從年檔收集所有出現過的球員 ID。
+
+    逐檔只讀 batter / pitcher 兩欄再取聯集，不把整份資料讀進記憶體。
+    12 季全讀是 7 GB 起跳，只讀兩欄是幾十 MB。
+    """
+    ids: set[int] = set()
+    for pth in paths:
+        df = pd.read_parquet(pth, columns=["batter", "pitcher"])
+        ids |= set(df["batter"].dropna().astype(int))
+        ids |= set(df["pitcher"].dropna().astype(int))
+    return sorted(ids)
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="抓 Statcast 逐球資料與球員身高體重")
+    ap = argparse.ArgumentParser(
+        description="抓 Statcast 逐球資料與球員身高體重",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "範例:\n"
+            "  --season all          全部 2015-2026\n"
+            "  --season 2019         只抓 2019\n"
+            "  --season 2015-2020    抓 2015 到 2020\n"
+            "  --season 2024,2025    只抓這兩季\n"
+            "已下載且已定版的月份會自動跳過，重跑安全。"
+        ),
+    )
     ap.add_argument(
-        "--season", default="model", choices=["profile", "model", "all"],
-        help="profile=2024 分群用, model=2025 建模用, all=兩季都抓",
+        "--season", default="all",
+        help="年份 / 區間 / 逗號列舉 / all / profile / model (預設 all)",
     )
     ap.add_argument("--force", action="store_true", help="忽略既有檔案，重新下載")
     ap.add_argument("--smoke", action="store_true", help="只抓 3 天資料，驗證管線")
     ap.add_argument("--skip-bio", action="store_true", help="不抓球員身高體重")
+    ap.add_argument(
+        "--report", action="store_true",
+        help="每季抓完後印出完整性檢查 (需把整季讀進記憶體，約 600 MB/季)",
+    )
     args = ap.parse_args()
 
     ensure_dirs()
@@ -310,10 +484,10 @@ def main() -> int:
 
     if args.smoke:
         log("=== SMOKE TEST: 2025-06-01 ~ 2025-06-03 ===")
-        p = fetch_statcast_chunk("smoke", "2025-06-01", "2025-06-03", force=True)
-        if p is None:
+        pth = fetch_statcast_chunk("smoke", "2025-06-01", "2025-06-03", force=True)
+        if pth is None:
             return 1
-        df = pd.read_parquet(p)
+        df = pd.read_parquet(pth)
         sanity_report(df)
         if not args.skip_bio:
             ids = sorted(set(df["batter"].dropna().astype(int)))[:100]
@@ -321,19 +495,34 @@ def main() -> int:
         log("SMOKE TEST 完成")
         return 0
 
-    keys = ["profile", "model"] if args.season == "all" else [args.season]
-    frames: list[pd.DataFrame] = []
-    for k in keys:
-        frames.append(fetch_statcast_season(k, args.force))
+    keys = resolve_seasons(args.season)
+    log(f"預計處理 {len(keys)} 季: {', '.join(keys)}")
 
-    combined = pd.concat(frames, ignore_index=True)
-    sanity_report(combined)
+    # 逐季處理並只留下路徑。不 concat 全部：
+    # 12 季合起來約 850 萬球 x 88 欄，進記憶體要 7 GB 以上。
+    season_paths: list[Path] = []
+    for k in keys:
+        try:
+            pth = fetch_statcast_season(k, args.force)
+        except Exception as exc:  # noqa: BLE001
+            log(f"! {k} 整季失敗: {exc}")
+            continue
+        if pth is None:
+            continue
+        season_paths.append(pth)
+        if args.report:
+            sanity_report(pd.read_parquet(pth))
+
+    if not season_paths:
+        log("! 沒有任何賽季成功，結束")
+        return 1
+
+    log(f"--- 共 {len(season_paths)} 季就緒 ---")
+    for pth in season_paths:
+        log(f"  {pth.name:<28} {pth.stat().st_size / 1e6:>7.1f} MB")
 
     if not args.skip_bio:
-        ids = sorted(
-            set(combined["batter"].dropna().astype(int))
-            | set(combined["pitcher"].dropna().astype(int))
-        )
+        ids = collect_player_ids(season_paths)
         log(f"需要 {len(ids)} 位球員的身高體重")
         fetch_player_bio(ids, force=args.force)
 

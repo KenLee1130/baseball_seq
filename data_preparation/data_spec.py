@@ -39,15 +39,84 @@ SPLIT_DIR = DATASET_DIR / "splits"     # train / test
 #   配球序列模型則在 MODEL_SEASON 上訓練與評估。
 #   如此一來，「這個打者屬於哪一群」不會偷看到他在建模賽季的表現。
 
+# Statcast 追蹤資料自 2015 年全面上線，2015 之前沒有逐球追蹤，故以此為下界。
+FIRST_STATCAST_YEAR = 2015
+LAST_SEASON_YEAR = 2026
+
+# 每季的抓取視窗刻意開寬 (3/01 ~ 11/10)，不精確對齊各年開幕日。
+# 理由有三：
+#   1. 開幕日逐年不同 (2025 因東京開幕戰提早到 3/18，2020 因疫情縮短為 7/23~9/27)，
+#      寫死日期等於每年都要維護。
+#   2. 視窗外的春訓 (S) 與季後賽 (D/F/L/W) 會被 KEEP_GAME_TYPES 濾掉，開寬不會混入雜訊。
+#   3. 完全沒有比賽的月份，fetch 端會寫下 .empty 標記，之後不再重複查詢。
+SEASON_WINDOW = ("03-01", "11-10")
+
+
+def season_range(year: int) -> dict[str, str]:
+    """回傳某一年的抓取視窗。"""
+    lo, hi = SEASON_WINDOW
+    return {"year": str(year), "start": f"{year}-{lo}", "end": f"{year}-{hi}"}
+
+
+# key 為年份字串，方便 CLI 直接用 --season 2019 指定。
 SEASONS: dict[str, dict[str, str]] = {
-    # 打者輪廓 / 分群用：上一個完整賽季
-    "profile": {"year": "2024", "start": "2024-03-20", "end": "2024-10-01"},
-    # 配球序列建模用
-    "model": {"year": "2025", "start": "2025-03-18", "end": "2025-10-01"},
+    str(y): season_range(y)
+    for y in range(FIRST_STATCAST_YEAR, LAST_SEASON_YEAR + 1)
 }
+
+# 語意別名，保留舊有用法。指向「最後一季」與「其前一季」，
+# 因為打者輪廓必須由前一季建立，才不會洩漏建模賽季的資訊。
+SEASON_ALIASES: dict[str, str] = {
+    "profile": str(LAST_SEASON_YEAR - 1),
+    "model": str(LAST_SEASON_YEAR),
+}
+
+# 欄位的可用起始年 —— 全部以實際下載的資料抽樣量測，不是憑文件推測。
+# 這張表決定「哪些特徵能回溯到哪一年」，進而決定模型真正能用幾季。
+#
+# 量測方式：每年取一天 (7/15，若逢全明星賽或休賽期改 8/15) 看非空值比例。
+# 值為 0% 者代表該欄位在當年完全不存在，不是抽樣誤差。
+COLUMN_AVAILABILITY: dict[str, int] = {
+    # -- bat tracking：2023 季中上線 --------------------------------------
+    # 實測 2023-06-15 為 0%、2023-08-15 為 46.3%，故 2023 只有後半季有值。
+    # 2024 起全季完整 (44.7%，約等於揮棒率，因為沒揮棒的球本來就沒有值)。
+    # 影響：「上一季平均揮棒速度」「上一季快速揮棒比例」這兩個特徵，
+    #       最早只能用在 2024 賽季 (以 2023 後半季為基準，且樣本偏頗)，
+    #       真正乾淨的用法是 2025 起 (以完整的 2024 為基準)。
+    "bat_speed": 2024,
+    "swing_length": 2024,
+    # -- 揮棒路徑細節：2024 起 --------------------------------------------
+    "attack_angle": 2024,
+    "attack_direction": 2024,
+    "swing_path_tilt": 2024,
+    "intercept_ball_minus_batter_pos_x_inches": 2024,
+    "intercept_ball_minus_batter_pos_y_inches": 2024,
+    # -- 手臂角度：2020 部分 (59%)，2021 起穩定 (97%+) ---------------------
+    # 實測 2015-2019 皆為 0%。
+    "arm_angle": 2021,
+}
+
+# 全程可用 (2015 起即有，抽樣皆 >90%) 的關鍵欄位。
+# 列出來是為了明確：序列特徵與情境特徵不受年份限制，12 季都能用。
+FULL_HISTORY_COLUMNS: tuple[str, ...] = (
+    "plate_x", "plate_z", "release_speed", "effective_speed", "release_extension",
+    "pfx_x", "pfx_z", "api_break_x_arm", "api_break_z_with_gravity",
+    "release_spin_rate", "spin_axis", "release_pos_x", "release_pos_z",
+    "pitch_type", "zone", "sz_top", "sz_bot",
+    "balls", "strikes", "outs_when_up", "on_1b", "on_2b", "on_3b",
+    "n_thruorder_pitcher", "pitcher_days_since_prev_game",
+    "description", "events", "launch_speed", "launch_angle", "hc_x", "hc_y",
+    "delta_run_exp", "estimated_woba_using_speedangle",
+)
+
+# 由上表推導：哪一年之後，全部規格欄位都齊備。
+# 需要揮棒機制特徵的分析，建模賽季不應早於此。
+FIRST_FULL_FEATURE_YEAR = 2025
+
 
 # 只保留例行賽。S=春訓, E=表演賽, A=明星賽, D/F/L/W=季後賽各輪。
 # 季後賽的配球策略與例行賽差異大 (投手配置、緊張度)，先排除，需要時再單獨分析。
+
 KEEP_GAME_TYPES = ("R",)
 
 
@@ -342,6 +411,45 @@ DERIVED_FEATURES: dict[str, dict[str, str]] = {
             "投手本場累計投球數。推導：(game_pk, pitcher) 依序累計。疲勞代理。"
         ),
         "count_state": "球數狀態，balls-strikes 當 12 個類別，不可當兩個數字",
+        "base_state": (
+            "壘包狀態。推導：on_1b/on_2b/on_3b 是否為 NaN -> 3 bit -> 8 個類別 "
+            "(空壘/一壘/二壘/.../滿壘)。當類別用，不要用跑者人數，因為"
+            "二三壘有人與一二壘有人對配球的意義不同 (前者不怕保送)。"
+        ),
+        "n_runners": "壘上人數 0-3。base_state 的粗粒度版，樣本不足時的退路。",
+        "risp": "得點圈有人 (二壘或三壘)。投手在此情境會明顯改變配球。",
+        "outs_when_up": (
+            "出局數 0-2。已是 Statcast 原始欄位，不需推導，"
+            "但必須與 base_state 一起看 (合稱 base-out state，24 種)。"
+        ),
+        "base_out_state": "base_state x outs 的 24 格狀態，得分期望值的標準座標",
+    },
+    # -- 打線脈絡：前幾棒發生了什麼 ----------------------------------------
+    # 與 sequence 的差別：sequence 的單位是「球」(同一打席內)，
+    # 這一組的單位是「打席」(同一場、同一進攻方、時間上更早的打席)。
+    # 假設：投手/捕手會因為前幾棒被打爆或抓到節奏而調整配球。
+    "lineup_context": {
+        "prev{j}_pa_events": (
+            "同一進攻方前 j 個打席的終結事件 (j=1,2,3)。推導：依 "
+            "(game_pk, inning_topbot) 取 at_bat_number 排序，對 events 非空的列做 shift(j)。"
+            "務必只用嚴格更早的打席，不可用到本打席自己的 events (那是未來資訊)。"
+        ),
+        "prev{j}_pa_result_class": (
+            "把 events 收斂成 out / single / xbh / bb_hbp / k 五類。"
+            "原始 events 有 20 種以上，直接當類別會樣本過薄。"
+        ),
+        "prev{j}_pa_launch_speed": "前 j 打席最後一球的擊球初速 (無觸球則缺值)",
+        "prev_pa_reached_count": (
+            "前 3 個打席中有幾個上壘。投手連續被上壘時傾向轉為保守配球。"
+        ),
+        "inning_batters_faced": (
+            "本半局至今已面對的打者數。推導：(game_pk, inning, inning_topbot) 內"
+            "相異 at_bat_number 的累計。與 base_out_state 一起描述「這局崩到什麼程度」。"
+        ),
+        "LEAKAGE_NOTE": (
+            "本組全部特徵都必須嚴格使用「本打席開始之前」已完成的打席。"
+            "用 shift 而非 rolling，且 shift 前務必先排序，否則會混入同打席或未來打席。"
+        ),
     },
     # -- 序列特徵：本專案的核心假設 ----------------------------------------
     # 直接把前幾球的原始值丟給模型，不如把「假設本身」算成特徵：
@@ -356,7 +464,15 @@ DERIVED_FEATURES: dict[str, dict[str, str]] = {
         "prev{k}_launch_speed": "前 k 球若有觸球的初速，衡量打者跟得上與否",
         "speed_diff_prev1": "本球球速 - 前一球球速。序列效應的主要載體。",
         "plate_dist_prev1": "本球與前一球進壘點的歐氏距離 (正規化後座標)",
-        "same_family_prev1": "是否與前一球同球種族",
+        "plate_dx_prev1": "進壘水平位置差 (正規化後)，保留方向性，與距離互補",
+        "plate_dz_prev1": "進壘垂直位置差 (正規化後)，保留方向性",
+        "pfx_dx_prev1": "水平位移差 pfx_x - prev1_pfx_x。位移差與球速差是兩件事：\n"
+                        "同樣 85 mph，橫move 差 10 吋的滑球與變速球，打者反應完全不同。",
+        "pfx_dz_prev1": "垂直位移差 pfx_z - prev1_pfx_z",
+        "pfx_dist_prev1": "位移向量的歐氏距離 sqrt(pfx_dx^2 + pfx_dz^2)，位移差的純量版",
+        "same_family_prev1": "是否與前一球同球種族 (球種差的二元版)",
+        "family_pair_prev1": "(prev1_pitch_family, pitch_family) 的有序配對，\n"
+                             "球種差的類別版。序列統計的最小單位，比二元的 same/diff 保留更多資訊。",
         "release_dist_prev1": (
             "本球與前一球出手點距離。距離小但進壘點遠 = tunneling 成功。"
         ),
@@ -381,24 +497,61 @@ DERIVED_FEATURES: dict[str, dict[str, str]] = {
             "否則左右打者的內外角會互相抵消。"
         ),
     },
-    # -- 打者分群輪廓 (PROFILE_SEASON 上計算) -------------------------------
-    # 分群特徵必須是「反應」不是「結果」。用打擊率會只分出強打者與弱打者。
+    # -- 打者輪廓：一律用「上一季」或「近期」，不可用當季 -------------------
+    # 這是整份 spec 最容易出錯的地方。打者輪廓若用當季資料計算，
+    # 再拿去預測當季的每一球，等於用結果預測結果 —— 模型會虛高，結論無效。
+    #
+    # 兩種時間基準，用途不同：
+    #   PREV_SEASON  上一季全季彙總。穩定、樣本大，但反應不了狀態變化。
+    #                用於「這名打者本質上是什麼型」的特徵。
+    #   ROLLING      本季截至前一天的滾動窗。會反應狀態，但早季樣本薄。
+    #                用於「他最近手感如何」的特徵。
     "batter_profile": {
-        "swing_rate_by_family_zone": "各球種族 x 好球帶區塊的揮棒率",
-        "whiff_rate_by_family_zone": "各球種族 x 區塊的揮空率",
-        "chase_rate_by_family": "各球種族的追打率 (好球帶外出棒)",
-        "ev_by_family": "各球種族的平均擊球初速",
-        "mean_bat_speed": "平均棒速",
-        "mean_swing_length": "平均揮棒長度",
-        "mean_attack_angle": "平均攻擊角 [2025 起]",
-        "pull_rate_by_family": (
-            "各球種族的拉打率。噴射角 = degrees(arctan2(hc_x-125.42, 198.27-hc_y))，"
+        "TIME_BASIS_NOTE": (
+            "prev_season_* 以打者上一季 (game_year - 1) 全季計算；"
+            "recent_* 以本季截至「本場比賽前一天」的滾動窗計算，窗長見 ROLLING_WINDOW。"
+            "兩者都不得包含本場及之後的任何一球。"
+        ),
+        "ROLLING_WINDOW": "近期特徵用最近 30 天，且要求窗內至少 50 次揮棒，否則退回上一季值",
+
+        # -- 揮棒機制 (需 bat tracking，2024 起才完整，見 COLUMN_AVAILABILITY) --
+        "prev_season_mean_bat_speed": (
+            "上一季平均揮棒速度 (mph)。只在有揮棒的球上平均。"
+            "用上一季而非當季：揮棒速度是打者的體能特質，季內變化慢，"
+            "用上一季既避免洩漏又幾乎不損失資訊。"
+        ),
+        "prev_season_fast_swing_rate": (
+            "上一季快速揮棒比例。定義：bat_speed >= 75 mph 的揮棒佔全部揮棒的比例。"
+            "75 mph 是 Statcast 官方 fast-swing 門檻。"
+            "這比平均棒速更能分辨「always 全力揮」與「看球種調整」兩種打者。"
+        ),
+        "prev_season_mean_swing_length": "上一季平均揮棒軌跡長度 (ft)",
+        "prev_season_mean_attack_angle": "上一季平均攻擊角 (度)，2024 起可用",
+
+        # -- 拉打傾向 (用近期，因為打者會在季中調整打擊策略) -------------------
+        "recent_pull_rate": (
+            "近期拉打率。噴射角 = degrees(arctan2(hc_x-125.42, 198.27-hc_y))，"
             "右打者 < -15 度為拉打，左打者 > 15 度為拉打。"
+            "改用近期而非上一季：拉打傾向是可調整的策略 (打者會因應佈陣改變)，"
+            "季內變化比揮棒速度大得多。"
             "不用 FanGraphs Pull%，因為該來源目前回 403。"
         ),
+        "recent_pull_rate_by_family": "各球種族的近期拉打率，樣本不足時收縮回整體值",
+
+        # -- 反應輪廓：分群的主要依據 ------------------------------------------
+        # 分群特徵必須是「反應」不是「結果」。用打擊率只會分出強打者與弱打者。
+        "prev_season_swing_rate_by_family_zone": "上一季各球種族 x 好球帶區塊的揮棒率",
+        "prev_season_whiff_rate_by_family_zone": "上一季各球種族 x 區塊的揮空率",
+        "prev_season_chase_rate_by_family": "上一季各球種族的追打率 (好球帶外出棒)",
+        "prev_season_ev_by_family": "上一季各球種族的平均擊球初速",
+
         "SHRINKAGE_NOTE": (
             "所有比率特徵必須做 shrinkage 往聯盟平均收縮，權重依樣本數。"
             "某打者在某區塊只遇過 5 球就決定他的分群，比不做標準化還危險。"
+        ),
+        "COLD_START_NOTE": (
+            "新人與上一季未出賽者沒有 prev_season_* 值。不可填 0 (那代表「揮棒速度 0」)。"
+            "做法：填聯盟平均並另開一個 is_rookie 指示欄位，讓模型自己決定怎麼用。"
         ),
     },
 }
