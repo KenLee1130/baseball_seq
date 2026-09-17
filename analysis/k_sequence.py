@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -502,6 +503,47 @@ def enumerate_paths(nodes, policy, cand):
     return paths
 
 
+def serialize_policy_tree(nodes, policy, cand):
+    """Serialize the chosen adaptive policy as a compact, UI-friendly tree."""
+    terminal_names = {"K": "三振", "BB": "保送", "soft": "弱擊", "hard": "強擊"}
+
+    def terminal(result, probability=None):
+        item = {"type": "terminal", "result": result}
+        if probability is not None:
+            item["probability"] = float(probability)
+        return item
+
+    def rec(hist, depth):
+        if hist not in nodes or policy.get(hist) is None:
+            return terminal("搜尋未展開")
+        choice = int(policy[hist])
+        balls, strikes, probs, _ = nodes[hist]
+        end, kids = branches(probs[choice], balls, strikes)
+        children = []
+        for result, prob in end.items():
+            if prob > 0:
+                children.append({
+                    "reaction": terminal_names[result],
+                    "probability": float(prob),
+                    "target": terminal(terminal_names[result]),
+                })
+        for reaction, prob, next_balls, next_strikes in kids:
+            next_hist = hist + ((choice, reaction, balls, strikes),)
+            target = terminal("5 球後未結束") if depth >= BUDGET else rec(next_hist, depth + 1)
+            children.append({
+                "reaction": ZH_TOK[reaction],
+                "probability": float(prob),
+                "next_count": f"{next_balls}-{next_strikes}",
+                "target": target,
+            })
+        return {
+            "type": "decision", "depth": depth, "count": f"{balls}-{strikes}",
+            "pitch": cand.at[choice, "variant"], "children": children,
+        }
+
+    return rec((), 1)
+
+
 def path_report(nodes, policy, cand, top=5):
     paths = enumerate_paths(nodes, policy, cand)
     totals = {}
@@ -525,10 +567,10 @@ def path_report(nodes, policy, cand, top=5):
     return lines
 
 
-def run(run_dir: Path, device: str):
+def run(run_dir: Path, device: str, out_dir: Path | None = None):
     run_dir = Path(run_dir)
-    out = run_dir / "k_sequence"
-    out.mkdir(exist_ok=True)
+    out = Path(out_dir) if out_dir else run_dir / "k_sequence"
+    out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(SEED)
     st = Setup(run_dir, device)
     khist = k_hist_table()
@@ -573,6 +615,7 @@ def run(run_dir: Path, device: str):
                             "5球內弱擊": res["soft"] if res else np.nan, "5球後未結束": res["unfinished"] if res else np.nan,
                             "門檻": threshold, "達到門檻的球數": reach})
         write_batter(out, name, bt, cand, strategies, threshold, nodes, policy, seq, k_rate, st.n_evals,
+                     p_throws=pt["p_throws"],
                      greedy_policy=greedy_policy, fixed_ranked=fixed_ranked)
 
     table = pd.DataFrame(summary)
@@ -594,7 +637,7 @@ def sim_path_lines(res, top=5):
 
 
 def write_batter(out, name, bt, cand, strategies, threshold, nodes, policy, seq, k_rate, n_evals,
-                 greedy_policy=None, fixed_ranked=None):
+                 p_throws=None, greedy_policy=None, fixed_ranked=None):
     pct = lambda v: "-" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:.1%}"
     lines = [f"# {PITCHER[0]} vs {name} (站位 {bt['stand']})", "", f"情境：{CONTEXT_TEXT}", "",
              f"門檻 = {PITCHER[0]} {SEASON} 年對其他{'右' if bt['stand'] == 'R' else '左'}打 (排除 {name}) 實際三振率 {k_rate:.1%} x {THRESHOLD_MULT} = **{threshold:.1%}**",
@@ -626,7 +669,83 @@ def write_batter(out, name, bt, cand, strategies, threshold, nodes, policy, seq,
               "| 球種_位置 | 投球數 | 使用比例 | 球速 | 轉速 | 水平位移 (打者視角) | 垂直位移 |", "|---|---|---|---|---|---|---|"]
     for r in cand.sort_values("n", ascending=False).itertuples():
         lines.append(f"| {r.variant} | {r.n} | {r.usage:.1%} | {r.release_speed:.1f} | {r.release_spin_rate:.0f} | {r.pfx_x_bv:+.2f} | {r.pfx_z:+.2f} |")
-    (out / f"{name.replace(' ', '_').replace('.', '')}.md").write_text("\n".join(lines) + "\n")
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or str(bt["batter"])
+    report = "\n".join(lines) + "\n"
+    (out / f"{slug}.md").write_text(report)
+
+    def clean(value):
+        if isinstance(value, dict):
+            return {str(k): clean(v) for k, v in value.items() if k != "paths"}
+        if isinstance(value, (list, tuple, np.ndarray)):
+            return [clean(v) for v in value]
+        if isinstance(value, np.generic):
+            value = value.item()
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return None
+        return value
+
+    strategy_json = []
+    for sname, (res, curve) in strategies.items():
+        top_paths = {}
+        if res and "paths" in res:
+            for ending in ("K", "hard"):
+                top_paths[ending] = [
+                    {"probability": float(prob), "sequence": path}
+                    for prob, path, end in res["paths"] if end == ending
+                ][:5]
+        strategy_json.append({
+            "name": sname,
+            "curve": clean(curve),
+            "outcomes": clean(res),
+            "top_paths": top_paths,
+            "is_actual": sname.startswith("實際"),
+        })
+
+    def policy_preview(selected_policy):
+        if not selected_policy or () not in selected_policy:
+            return None
+        root = int(selected_policy[()])
+        b, s, probs, _ = nodes[()]
+        _, kids = branches(probs[root], b, s)
+        responses = []
+        for tok, prob, nb, ns in kids:
+            hist = ((root, tok, b, s),)
+            choice = selected_policy.get(hist)
+            responses.append({
+                "reaction": ZH_TOK[tok], "probability": float(prob),
+                "count": f"{nb}-{ns}",
+                "next_pitch": cand.at[int(choice), "variant"] if choice is not None else None,
+            })
+        return {"first_pitch": cand.at[root, "variant"], "responses": responses}
+
+    actual_label = next((s["name"] for s in strategy_json if s["name"].startswith("實際：對其他")), None)
+    payload = {
+        "schema_version": 1,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "pitcher": {"id": int(PITCHER[1]), "name": PITCHER[0], "throws": p_throws},
+        "batter": {"id": int(bt["batter"]), "name": name, "stand": bt["stand"]},
+        "season": SEASON,
+        "budget": BUDGET,
+        "context": CONTEXT_TEXT,
+        "threshold": clean(float(threshold)),
+        "baseline_k_rate": clean(float(k_rate)),
+        "model_evaluations": int(n_evals),
+        "strategies": strategy_json,
+        "actual_baseline_strategy": actual_label,
+        "policy_preview": {
+            "adaptive": policy_preview(policy),
+            "greedy": policy_preview(greedy_policy),
+        },
+        "policy_tree": serialize_policy_tree(nodes, policy, cand),
+        "fixed_sequences": [
+            {"rank": i, "k_probability": float(k),
+             "pitches": [cand.at[int(c), "variant"] for c in sq]}
+            for i, (sq, k) in enumerate(fixed_ranked or [], 1)
+        ],
+        "candidates": clean(cand.sort_values("n", ascending=False).to_dict(orient="records")),
+        "report_file": f"{slug}.md",
+    }
+    (out / f"{slug}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
 
 
 def plot_curves(curves, path):
@@ -663,11 +782,30 @@ def main() -> int:
     ap.add_argument("--run", required=True)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--batters", nargs="*", help="只跑這些打者 (名字需與 BATTERS 相同)，預設全部")
+    ap.add_argument("--pitcher-id", type=int, help="覆寫投手 MLBAM ID")
+    ap.add_argument("--pitcher-name", help="覆寫投手顯示名稱")
+    ap.add_argument("--batter", action="append", metavar="ID:NAME",
+                    help="指定打者，可重複使用；例如 --batter '592450:Aaron Judge'")
+    ap.add_argument("--out", type=Path, help="輸出目錄（預設為 <run>/k_sequence）")
     args = ap.parse_args()
+    global PITCHER, BATTERS
+    if args.pitcher_id:
+        PITCHER = (args.pitcher_name or str(args.pitcher_id), args.pitcher_id)
+    elif args.pitcher_name:
+        PITCHER = (args.pitcher_name, PITCHER[1])
+    if args.batter:
+        selected = []
+        for value in args.batter:
+            raw_id, sep, name = value.partition(":")
+            if not sep or not raw_id.isdigit() or not name.strip():
+                ap.error(f"--batter 格式必須是 ID:NAME，收到 {value!r}")
+            selected.append((name.strip(), int(raw_id)))
+        BATTERS = selected
     if args.batters:
-        global BATTERS
         BATTERS = [b for b in BATTERS if b[0] in args.batters]
-    run(Path(args.run), args.device)
+    if not BATTERS:
+        ap.error("沒有可分析的打者")
+    run(Path(args.run), args.device, args.out)
     return 0
 
 

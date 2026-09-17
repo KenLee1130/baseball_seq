@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#071b22">
+  <title>PitchSeq｜五球配球決策</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="noise"></div>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="PitchSeq 首頁"><span class="brand-mark">P</span><span>PitchSeq</span></a>
+    <span class="season-pill" id="seasonPill">STATCAST</span>
+    <button class="ghost-button" id="aboutButton">如何解讀</button>
+  </header>
+
+  <main>
+    <section class="hero">
+      <p class="eyebrow">K-SEQUENCE DECISION LAB</p>
+      <h1>五球之內，<br><em>怎麼拿下三振？</em></h1>
+      <p class="lede">從實際球路建立候選，讓模型比較應變、固定、貪婪與投手原有配球。每個建議都能一路展開成決策樹。</p>
+    </section>
+
+    <section class="selector panel">
+      <div class="step"><span>01</span><label for="runSelect">模型版本</label><select id="runSelect"></select></div>
+      <div class="step"><span>02</span><label for="pitcherSelect">選擇投手</label><select id="pitcherSelect"></select></div>
+      <div class="step target-step">
+        <span>03</span><label for="batterSelect">指定打者</label>
+        <div class="hand-filter" role="group" aria-label="打擊站位">
+          <button data-hand="all" class="active">全部</button><button data-hand="R">右打</button><button data-hand="L">左打</button>
+        </div>
+        <select id="batterSelect"></select>
+      </div>
+      <button class="analyze-button" id="analyzeButton"><span>開始分析</span><b>→</b></button>
+      <p class="selector-note">分析會在背景執行；完整搜尋可能需要一段時間。相同組合會直接讀取快取。</p>
+    </section>
+
+    <section class="history-wrap" id="historyWrap" hidden>
+      <div class="section-heading"><div><p class="eyebrow">RECENT MATCHUPS</p><h2>已完成的分析</h2></div></div>
+      <div class="history-list" id="historyList"></div>
+    </section>
+
+    <section class="job panel" id="jobPanel" hidden>
+      <div class="job-head"><div><p class="eyebrow">ANALYSIS RUNNING</p><h2 id="jobTitle">模型正在搜尋策略樹</h2></div><div class="spinner"></div></div>
+      <div class="progress-track"><i></i></div>
+      <pre id="jobLog">準備資料…</pre>
+    </section>
+
+    <section id="results" hidden>
+      <div class="matchup-head">
+        <div><p class="eyebrow">MATCHUP REPORT</p><h2><span id="pitcherName"></span><small>VS</small><span id="batterName"></span></h2><p id="contextText"></p></div>
+        <div class="matchup-tags"><span id="handTag"></span><span>最多 5 球</span><span id="modelTag">模型模擬</span></div>
+      </div>
+
+      <div class="metric-grid" id="metricGrid"></div>
+
+      <div class="dashboard-grid">
+        <article class="panel chart-panel">
+          <div class="panel-title"><div><p class="eyebrow">CUMULATIVE K%</p><h3>球數內三振機率</h3></div><div class="legend" id="chartLegend"></div></div>
+          <div class="chart" id="curveChart"></div>
+        </article>
+        <article class="panel sequence-panel">
+          <div class="panel-title"><div><p class="eyebrow">TOP FIXED SEQUENCE</p><h3>最佳固定配球</h3></div><strong id="fixedK"></strong></div>
+          <div class="pitch-sequence" id="pitchSequence"></div>
+          <p>不論打者反應，依序投出的五球方案。下方可以比較其他排名。</p>
+          <div class="ranked-list" id="rankedList"></div>
+        </article>
+      </div>
+
+      <article class="panel strategy-panel">
+        <div class="panel-title"><div><p class="eyebrow">STRATEGY COMPARISON</p><h3>策略與真實結果</h3></div><span class="threshold" id="thresholdLabel"></span></div>
+        <div class="table-scroll"><table><thead><tr><th>策略</th><th>3 球內</th><th>4 球內</th><th>5 球內三振</th><th>保送</th><th>強擊</th><th>弱擊</th><th>未結束</th></tr></thead><tbody id="strategyRows"></tbody></table></div>
+      </article>
+
+      <article class="panel paths-panel" id="pathsPanel">
+        <div class="panel-title"><div><p class="eyebrow">SEQUENCE EXAMPLES</p><h3>各策略的三振配球路徑</h3></div><select id="pathStrategy"></select></div>
+        <div class="path-list" id="pathList"></div>
+      </article>
+
+      <article class="panel tree-panel">
+        <div class="panel-title tree-title">
+          <div><p class="eyebrow">ADAPTIVE DECISION TREE</p><h3>最佳應變策略樹</h3><p>點擊節點可收合；分支百分比是該顆球後的條件機率。</p></div>
+          <div class="tree-actions"><label>顯示深度 <select id="treeDepth"><option>2</option><option selected>3</option><option>4</option><option>5</option></select></label><button class="ghost-button" id="downloadTree">下載 SVG</button></div>
+        </div>
+        <div class="tree-key"><span class="key-decision">建議球路</span><span class="key-k">三振</span><span class="key-risk">強擊／保送</span><span class="key-open">打席繼續</span></div>
+        <div class="decision-tree" id="decisionTree"></div>
+        <div class="empty-state" id="treeEmpty" hidden>這是舊版分析結果，重新執行一次即可產生完整五層決策樹。</div>
+      </article>
+
+      <article class="panel report-panel">
+        <details><summary><span><b>完整研究報告</b><small>檢視路徑、候選球與方法細節</small></span><i>＋</i></summary><pre id="fullReport"></pre></details>
+      </article>
+    </section>
+  </main>
+
+  <dialog id="aboutDialog"><button class="dialog-close" aria-label="關閉">×</button><p class="eyebrow">READING THE MODEL</p><h2>這不是單一路徑預測</h2><p>最佳應變策略是一棵樹：每投一球，就依打者的壞球、看好球、揮空或界外反應選下一球。三振、保送與打進場則是終點。</p><p>模擬策略使用同一個模型與 10,000 個打席，因此可以橫向比較；「實際」列則完全來自 Statcast 真實打席，樣本數會顯示在策略名稱裡。</p></dialog>
+  <div class="toast" id="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

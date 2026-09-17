@@ -55,6 +55,40 @@ python -m pytest tests/                                  # 測試
 ```
 
 
+## 配球策略 UI
+
+本機網頁介面可搜尋 2026 年資料中的投手與打者，以右／左打站位篩選打者，執行
+`k_sequence`，並比較最佳應變、最佳固定、貪婪、投手實際傾向、隨機配球與真實打席。
+
+```bash
+.venv/bin/python -m ui.server
+# 瀏覽器開啟 http://127.0.0.1:8765
+```
+
+直接使用虛擬環境裡的 Python，可以避免系統的 `python3`（例如 Ubuntu 20.04 的
+Python 3.8）誤跑 UI。若要先啟用環境，也可以執行
+`source .venv/bin/activate` 後再用 `python -m ui.server`。
+
+分析在背景程序執行，瀏覽器會持續顯示搜尋進度；相同模型、投手與打者的組合會讀取
+`runs/<run>/k_sequence_ui/` 中的快取。結果頁包含：
+
+- 1–5 球內累積三振率與所有策略的結果比較
+- 最佳固定五球序列與前幾名候選
+- 最佳應變策略的可收合決策樹（球數、建議球路、打者反應與條件機率）
+- 目前顯示深度的策略樹 SVG 下載
+- 原始完整 Markdown 報告
+
+也可不經 UI，直接指定任意球員執行：
+
+```bash
+python -m analysis.k_sequence \
+  --run runs/<run> \
+  --pitcher-id 808967 --pitcher-name 山本由伸 \
+  --batter "592450:Aaron Judge" \
+  --out runs/<run>/k_sequence_ui/808967/592450
+```
+
+
 ## 各檔案做了什麼
 
 ### data_preparation/data_spec.py
