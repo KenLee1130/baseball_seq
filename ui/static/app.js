@@ -1,7 +1,8 @@
 const $ = (q) => document.querySelector(q);
 const $$ = (q) => [...document.querySelectorAll(q)];
-const state = { boot: null, hand: "all", result: null, poll: null };
+const state = { boot: null, hand: "all", result: null, resultId: null, poll: null, jobsPoll: null, activeJobIds: new Set() };
 const palette = ["#087e78", "#65a743", "#f26b3a", "#735aa5", "#bf8438", "#63767b", "#a3aaa5"];
+const pitchColors = {"四縫線":"#2474c8","伸卡":"#e88931","卡特":"#23966f","滑球":"#7654b3","曲球":"#d14b4b","變速":"#1b9aaa","其他":"#718087"};
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -16,10 +17,11 @@ async function api(url, options) {
 }
 
 async function init() {
+  renderZoneDefinition();
   try {
     state.boot = await api("/api/bootstrap");
     $("#seasonPill").textContent = `${state.boot.season} STATCAST`;
-    fillSelect($("#runSelect"), state.boot.runs, x=>x.id, x=>x.label);
+    $("#modelName").textContent=state.boot.model.label;
     fillSelect($("#pitcherSelect"), state.boot.pitchers, x=>x.id, x=>`${x.name} · ${x.throws}投 · ${x.pitches.toLocaleString()} 球`);
     const yamamoto = state.boot.pitchers.find(x=>x.id===808967);
     if (yamamoto) $("#pitcherSelect").value=yamamoto.id;
@@ -27,6 +29,7 @@ async function init() {
     const judge = state.boot.batters.find(x=>x.id===592450);
     if (judge) $("#batterSelect").value=judge.id;
     renderHistory();
+    await refreshActiveJobs();
   } catch (error) { toast(`載入失敗：${error.message}`); }
 }
 function fillSelect(element, items, value, label) {
@@ -40,10 +43,47 @@ function renderBatters() {
 }
 function renderHistory() {
   const rows=state.boot.results;
-  if (!rows.length) return;
+  if (!rows.length) {$("#historyWrap").hidden=true;return}
   $("#historyWrap").hidden=false;
-  $("#historyList").innerHTML=rows.map(x=>`<button class="history-card" data-result="${x.id}"><b>${esc(x.pitcher)} → ${esc(x.batter)}</b><small>${x.source==="legacy"?"既有報告":(x.generated_at||"").slice(0,10)}</small></button>`).join("");
+  $("#historyList").innerHTML=rows.map(x=>`<button class="history-card ${x.outdated?'outdated':''}" data-result="${x.id}"><b>${esc(x.pitcher)} → ${esc(x.batter)}</b><small>${x.outdated?'舊版結果':`${(x.generated_at||'').slice(0,10)} · 已保存`}</small></button>`).join("");
   $$(".history-card").forEach(button=>button.onclick=()=>loadResult(button.dataset.result));
+}
+async function refreshHistory() {
+  const fresh=await api("/api/bootstrap");
+  state.boot.results=fresh.results;
+  renderHistory();
+}
+
+function elapsedTime(startedAt) {
+  const seconds=Math.max(0,Math.floor((Date.now()-new Date(startedAt).getTime())/1000));
+  if(!Number.isFinite(seconds))return "剛剛開始";
+  const minutes=Math.floor(seconds/60),remainder=seconds%60;
+  return minutes?`${minutes} 分 ${remainder} 秒`:`${remainder} 秒`;
+}
+function renderActiveJobs(jobs) {
+  const panel=$("#jobPanel"),button=$("#analyzeButton");
+  panel.hidden=!jobs.length;
+  button.disabled=jobs.length>0;
+  if(!jobs.length){$("#jobList").innerHTML="";return}
+  $("#activeJobCount").textContent=`${jobs.length} 項執行中`;
+  $("#jobList").innerHTML=jobs.map(job=>{
+    const lines=(job.progress||[]).slice(-12).join("\n") || "準備資料與載入模型…";
+    return `<article class="job-item" data-job-id="${esc(job.id)}"><div class="job-item-head"><div><span class="job-status"><i></i>${job.status==="queued"?"等待執行":"分析中"}</span><h3>${esc(job.pitcher)} <small>VS</small> ${esc(job.batter)}</h3><p>已執行 ${elapsedTime(job.started_at)} · 開始於 ${esc((job.started_at||"").replace("T"," "))}</p></div><div class="spinner" aria-hidden="true"></div></div><div class="progress-track"><i></i></div><details open><summary>最新執行紀錄</summary><pre>${esc(lines)}</pre></details></article>`;
+  }).join("");
+}
+async function refreshActiveJobs() {
+  clearTimeout(state.jobsPoll);
+  try {
+    const payload=await api("/api/jobs"),jobs=payload.jobs||[];
+    const previous=state.activeJobIds;
+    state.activeJobIds=new Set(jobs.map(job=>job.id));
+    renderActiveJobs(jobs);
+    if(previous.size && !jobs.length)await refreshHistory();
+  } catch(error) {
+    if(state.boot)toast(`無法更新分析狀態：${error.message}`);
+  } finally {
+    state.jobsPoll=setTimeout(refreshActiveJobs,1800);
+  }
 }
 
 $$('.hand-filter button').forEach(button=>button.onclick=()=>{
@@ -53,6 +93,7 @@ $$('.hand-filter button').forEach(button=>button.onclick=()=>{
 $("#aboutButton").onclick=()=>$("#aboutDialog").showModal();
 $(".dialog-close").onclick=()=>$("#aboutDialog").close();
 $("#analyzeButton").onclick=startAnalysis;
+$("#downloadBundle").onclick=()=>downloadBundle(false);
 $("#treeDepth").onchange=()=>renderTree();
 $("#downloadTree").onclick=downloadTree;
 
@@ -60,12 +101,13 @@ async function startAnalysis() {
   const button=$("#analyzeButton"); button.disabled=true;
   try {
     const job=await api("/api/analyze", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
-      run:$("#runSelect").value,pitcher_id:+$("#pitcherSelect").value,batter_id:+$("#batterSelect").value
+      pitcher_id:+$("#pitcherSelect").value,batter_id:+$("#batterSelect").value
     })});
-    if (job.status==="cached") { toast("已載入相同對戰的快取結果"); button.disabled=false; return loadResult(job.result_id); }
-    $("#jobPanel").hidden=false; $("#results").hidden=true;
-    $("#jobTitle").textContent=`${job.pitcher} vs ${job.batter}`;
-    $("#jobLog").textContent="排入分析工作…";
+    if (job.status==="cached") {
+      toast("已載入相同對戰的快取結果"); button.disabled=false;
+      if(await loadResult(job.result_id)){await refreshHistory();downloadBundle(true)} return;
+    }
+    state.activeJobIds.add(job.id); renderActiveJobs([job]); $("#results").hidden=true;
     $("#jobPanel").scrollIntoView({behavior:"smooth",block:"start"});
     pollJob(job.id);
   } catch(error) { button.disabled=false; toast(error.message); }
@@ -74,20 +116,31 @@ async function pollJob(id) {
   clearTimeout(state.poll);
   try {
     const job=await api(`/api/jobs/${id}`);
-    $("#jobLog").textContent=(job.progress||[]).slice(-30).join("\n") || "準備資料…";
-    $("#jobLog").scrollTop=$("#jobLog").scrollHeight;
-    if (job.status==="complete") { $("#jobPanel").hidden=true; $("#analyzeButton").disabled=false; toast("分析完成"); return loadResult(job.result_id); }
+    if (job.status==="complete") {
+      await refreshActiveJobs(); $("#analyzeButton").disabled=false;
+      if(await loadResult(job.result_id)){await refreshHistory();downloadBundle(true)} return;
+    }
     if (job.status==="failed") throw new Error(job.error || "分析失敗");
+    renderActiveJobs([job]);
     state.poll=setTimeout(()=>pollJob(id),1800);
-  } catch(error) { $("#jobPanel").hidden=true; $("#analyzeButton").disabled=false; toast(error.message); }
+  } catch(error) { await refreshActiveJobs(); $("#analyzeButton").disabled=false; toast(error.message); }
 }
 async function loadResult(id) {
   try {
     state.result=await api(`/api/results/${id}`);
+    state.resultId=id;
     renderResult();
     $("#results").hidden=false;
     $("#results").scrollIntoView({behavior:"smooth",block:"start"});
-  } catch(error) { toast(error.message); }
+    return true;
+  } catch(error) { state.resultId=null; toast(error.message); return false; }
+}
+function downloadBundle(automatic=false) {
+  if(!state.resultId) return toast("請先開啟一份分析結果");
+  const link=document.createElement("a");
+  link.href=`/api/results/${state.resultId}/download`;
+  link.download=""; document.body.appendChild(link); link.click(); link.remove();
+  if(automatic) toast("分析完成，正在下載完整結果 ZIP");
 }
 
 function strategy(nameStarts) { return state.result.strategies.find(x=>x.name.startsWith(nameStarts)); }
@@ -95,7 +148,7 @@ function renderResult() {
   const r=state.result, adaptive=strategy("最佳應變"), tendency=strategy("投手實際傾向");
   $("#pitcherName").textContent=r.pitcher.name; $("#batterName").textContent=r.batter.name;
   $("#contextText").textContent=r.context; $("#handTag").textContent=r.batter.stand==="R"?"右打者":"左打者";
-  $("#modelTag").textContent=r.legacy?"既有分析":"模型模擬";
+  $("#modelTag").textContent=(r.schema_version||0)<2?"舊版分析 · 已保存":"最新模型 · 已保存";
   const best=adaptive?.curve?.[4], base=tendency?.curve?.[4], hard=adaptive?.outcomes?.hard;
   const reach=adaptive?.curve?.findIndex(x=>x!=null && x>=r.threshold);
   $("#metricGrid").innerHTML=[
@@ -104,7 +157,7 @@ function renderResult() {
     ["5 球內強擊風險",pct(hard),"最佳應變策略",""],
     ["達到門檻",reach>=0?`第 ${reach+1} 球`:"未達",`目標 ${pct(r.threshold)}`,""]
   ].map(x=>`<article class="metric panel ${x[3]}"><label>${x[0]}</label><strong>${x[1]}</strong><small>${x[2]}</small></article>`).join("");
-  renderChart(); renderFixed(); renderStrategyTable(); renderPaths(); renderTree();
+  renderChart(); renderFixed(); renderStrategyTable(); renderTree();
   $("#thresholdLabel").textContent=`門檻 ${pct(r.threshold)}`;
   $("#fullReport").textContent=r.report_markdown || "此分析沒有文字報告。";
 }
@@ -129,18 +182,92 @@ function renderFixed() {
 }
 function renderStrategyTable() {
   const rows=state.result.strategies,best=Math.max(...rows.filter(x=>!x.is_actual).map(x=>x.curve?.[4]??-1));
-  $("#strategyRows").innerHTML=rows.map(s=>`<tr class="${s.is_actual?'actual-row ':''}${s.curve?.[4]===best?'best-row':''}"><td>${esc(s.name)}</td><td>${pct(s.curve?.[2])}</td><td>${pct(s.curve?.[3])}</td><td>${pct(s.curve?.[4])}</td><td>${pct(s.outcomes?.BB)}</td><td>${pct(s.outcomes?.hard)}</td><td>${pct(s.outcomes?.soft)}</td><td>${pct(s.outcomes?.unfinished)}</td></tr>`).join("");
+  $("#strategyRows").innerHTML=rows.map((s,index)=>{
+    const sequences=strategySequences(s), expandable=sequences.length>0;
+    const name=expandable?`<button class="strategy-toggle" data-strategy="${index}" aria-expanded="false"><span>${esc(s.name)}</span><i>⌄</i></button>`:esc(s.name);
+    const main=`<tr class="strategy-row ${s.is_actual?'actual-row ':''}${s.curve?.[4]===best?'best-row':''}"><td>${name}</td><td>${pct(s.curve?.[2])}</td><td>${pct(s.curve?.[3])}</td><td>${pct(s.curve?.[4])}</td><td>${pct(s.outcomes?.BB)}</td><td>${pct(s.outcomes?.hard)}</td><td>${pct(s.outcomes?.soft)}</td><td>${pct(s.outcomes?.unfinished)}</td></tr>`;
+    const detail=expandable?`<tr class="strategy-detail-row" id="strategyDetail${index}" hidden><td colspan="8"><div class="strategy-visual" id="strategyVisual${index}"></div></td></tr>`:"";
+    return main+detail;
+  }).join("");
+  $$(".strategy-toggle").forEach(button=>button.onclick=()=>{
+    const index=+button.dataset.strategy, detail=$(`#strategyDetail${index}`), opening=detail.hidden;
+    $$(".strategy-detail-row").forEach(row=>row.hidden=true);
+    $$(".strategy-toggle").forEach(item=>item.setAttribute("aria-expanded","false"));
+    if(opening){detail.hidden=false;button.setAttribute("aria-expanded","true");renderStrategyVisual(index,0)}
+  });
 }
-function renderPaths() {
-  const choices=state.result.strategies.filter(s=>s.top_paths?.K?.length);
-  const panel=$("#pathsPanel"), select=$("#pathStrategy");
-  if(!choices.length){panel.hidden=true;return} panel.hidden=false;
-  select.innerHTML=choices.map((s,i)=>`<option value="${i}">${esc(s.name)}</option>`).join("");
-  const draw=()=>{
-    const paths=choices[+select.value].top_paths.K;
-    $("#pathList").innerHTML=paths.map((p,i)=>`<div class="path-row"><strong>${pct(p.probability,2)}</strong><p><small>#${i+1}</small> ${esc(p.sequence).replaceAll("；","<br>").replaceAll("**三振**","<strong>三振</strong>")}</p></div>`).join("");
-  };
-  select.onchange=draw; draw();
+function candidateDetails(variants) {
+  const candidates=state.result.candidates||[];
+  return variants.map((variant,pitchIndex)=>{
+    const row=candidates.find(c=>c.variant===variant);
+    return row?{...row,variant,family_zh:variant.split("_",1)[0],region:variant.split("_").slice(1).join("_"),pitch_number:pitchIndex+1}:null;
+  }).filter(Boolean);
+}
+function detailsFromPath(path) {
+  const variants=[...String(path||"").matchAll(/第\s*\d+\s*球\s*\([^)]+\)\s*([^→；]+?)\s*→/g)].map(match=>match[1].trim());
+  return candidateDetails(variants);
+}
+function strategySequences(strategyRow) {
+  if(strategyRow.name.startsWith("最佳固定")){
+    return (state.result.fixed_sequences||[]).slice(0,5).map(row=>({
+      probability:row.k_probability,label:`固定序列 #${row.rank}`,
+      pitches:row.pitch_details?.length?row.pitch_details:candidateDetails(row.pitches||[]),sequence:(row.pitches||[]).join(" → ")
+    })).filter(row=>row.pitches.length);
+  }
+  return (strategyRow.top_paths?.K||[]).slice(0,5).map((row,index)=>({
+    probability:row.probability,label:`三振路徑 #${index+1}`,
+    pitches:row.pitches?.length?row.pitches:detailsFromPath(row.sequence),sequence:row.sequence
+  })).filter(row=>row.pitches.length);
+}
+function renderStrategyVisual(strategyIndex,sequenceIndex) {
+  const strategyRow=state.result.strategies[strategyIndex],sequences=strategySequences(strategyRow),selected=sequences[sequenceIndex];
+  if(!selected)return;
+  const host=$(`#strategyVisual${strategyIndex}`);
+  host.innerHTML=`<div class="visual-controls"><div><p class="eyebrow">PITCH LOCATION MAP</p><h4>${esc(strategyRow.name)}</h4></div><label>選擇序列<select class="sequence-choice">${sequences.map((row,i)=>`<option value="${i}" ${i===sequenceIndex?'selected':''}>${esc(row.label)} · ${pct(row.probability,2)}</option>`).join("")}</select></label></div><div class="location-layout"><div class="pitch-map">${pitchMapSvg(selected.pitches,state.result.batter.stand)}</div><aside><div class="pitch-map-legend">${pitchLegend(selected.pitches)}</div><div class="mapped-sequence">${selected.pitches.map((pitch,i)=>`<div><b style="--pitch:${pitchColor(pitch)}">${i+1}</b><span><strong>${esc(pitch.variant)}</strong><small>${pitch.count?`球數 ${esc(pitch.count)} · `:""}${formatCoordinate(pitch)}</small></span></div>`).join("")}</div></aside></div>`;
+  host.querySelector(".sequence-choice").onchange=event=>renderStrategyVisual(strategyIndex,+event.target.value);
+}
+function pitchColor(pitch) {
+  const family=pitch.family_zh||String(pitch.variant||"").split("_")[0]||"其他";
+  return pitchColors[family]||pitchColors.其他;
+}
+function formatCoordinate(pitch) {
+  const x=Number(pitch.plate_x_bv),z=Number(pitch.plate_z_norm);
+  return `${esc(pitch.region||"")} · x ${Number.isFinite(x)?x.toFixed(2):"—"} / z ${Number.isFinite(z)?z.toFixed(2):"—"}`;
+}
+function pitchLegend(pitches) {
+  const families=[...new Map(pitches.map(p=>[p.family_zh||String(p.variant).split("_")[0],pitchColor(p)])).entries()];
+  return families.map(([name,color])=>`<span><i style="--pitch:${color}"></i>${esc(name)}</span>`).join("");
+}
+function batterSilhouette(stand) {
+  const transform=stand==="L"?'translate(620 0) scale(-1 1)':'';
+  return `<g transform="${transform}" opacity=".14" fill="#09232b" stroke="#09232b" stroke-linecap="round"><circle cx="48" cy="166" r="15"/><path d="M44 183 Q55 205 48 244 L29 300 M48 244 L69 300" fill="none" stroke-width="13"/><path d="M48 198 L78 220" fill="none" stroke-width="11"/><path d="M51 191 L80 169" fill="none" stroke-width="10"/><line x1="72" y1="177" x2="127" y2="92" stroke-width="8"/></g>`;
+}
+function pitchMapSvg(pitches,stand) {
+  const width=620,height=410,left=110,right=510,top=28,bottom=354;
+  const xmin=-2.1,xmax=2.1,ymin=-.55,ymax=1.55;
+  const sx=x=>left+(x-xmin)/(xmax-xmin)*(right-left),sy=y=>bottom-(y-ymin)/(ymax-ymin)*(bottom-top);
+  const zx0=sx(-1),zx1=sx(1),zy0=sy(0),zy1=sy(1),zw=zx1-zx0,zh=zy0-zy1;
+  const located=pitches.map((pitch,index)=>{
+    const relative=Number(pitch.plate_x_bv),z=Number(pitch.plate_z_norm);
+    if(!Number.isFinite(relative)||!Number.isFinite(z))return null;
+    return {...pitch,index,x:stand==="L"?-relative:relative,z};
+  }).filter(Boolean);
+  const insideLeft=stand==="L"?"外角":"內角",insideRight=stand==="L"?"內角":"外角";
+  let svg=`<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${stand==='L'?'左打':'右打'}配球落點圖"><rect x="${left}" y="${top}" width="${right-left}" height="${bottom-top}" rx="13" fill="#f2f0e8" stroke="#d9d7cd"/>${batterSilhouette(stand)}<text x="${stand==='L'?570:50}" y="326" text-anchor="middle" class="batter-label">${stand==='L'?'左打':'右打'}</text>`;
+  svg+=`<rect x="${zx0}" y="${zy1}" width="${zw}" height="${zh}" fill="#fffdf7" stroke="#09232b" stroke-width="2"/>`;
+  for(let i=1;i<3;i++){svg+=`<line x1="${zx0+zw*i/3}" y1="${zy1}" x2="${zx0+zw*i/3}" y2="${zy0}" class="zone-line"/><line x1="${zx0}" y1="${zy1+zh*i/3}" x2="${zx1}" y2="${zy1+zh*i/3}" class="zone-line"/>`}
+  svg+=`<text x="${zx0+6}" y="${zy1-8}" class="corner-label">${insideLeft}</text><text x="${zx1-6}" y="${zy1-8}" text-anchor="end" class="corner-label">${insideRight}</text><path d="M${sx(-.34)} ${bottom+5} L${sx(.34)} ${bottom+5} L${sx(.25)} ${bottom+20} L${sx(0)} ${bottom+29} L${sx(-.25)} ${bottom+20} Z" fill="none" stroke="#9aa7a5"/>`;
+  if(located.length>1)svg+=`<polyline points="${located.map(p=>`${sx(p.x)},${sy(p.z)}`).join(" ")}" fill="none" stroke="#899794" stroke-width="2" stroke-dasharray="5 6"/>`;
+  located.forEach(p=>{const cx=sx(Math.max(xmin,Math.min(xmax,p.x))),cy=sy(Math.max(ymin,Math.min(ymax,p.z))),color=pitchColor(p);svg+=`<g><circle cx="${cx}" cy="${cy}" r="14" fill="${color}" stroke="#fffdf7" stroke-width="3"><title>第 ${p.index+1} 球 ${esc(p.variant)}｜${formatCoordinate(p)}</title></circle><text x="${cx}" y="${cy+4}" text-anchor="middle" class="pitch-number">${p.index+1}</text></g>`});
+  svg+=`<text x="${(left+right)/2}" y="394" text-anchor="middle" class="axis-note">投捕視角 · 虛線連接投球順序 · 方框為打者個人化好球帶</text></svg>`;
+  return svg;
+}
+function renderZoneDefinition() {
+  const host=$("#zoneDefinition"); if(!host)return;
+  const cells=[["內角高","中間高","外角高"],["內角中","正中","外角中"],["內角低","中間低","外角低"]];
+  let svg=`<svg viewBox="0 0 380 310" role="img" aria-label="好球帶九宮格和壞球區域定義"><rect x="18" y="12" width="344" height="46" rx="9" class="outside-cell"/><text x="190" y="40" text-anchor="middle">帶外高</text><rect x="18" y="58" width="60" height="180" rx="9" class="outside-cell"/><text x="48" y="138" text-anchor="middle"><tspan x="48">帶外</tspan><tspan x="48" dy="18">內角</tspan></text><rect x="302" y="58" width="60" height="180" rx="9" class="outside-cell"/><text x="332" y="138" text-anchor="middle"><tspan x="332">帶外</tspan><tspan x="332" dy="18">外角</tspan></text><rect x="18" y="238" width="344" height="46" rx="9" class="outside-cell"/><text x="190" y="267" text-anchor="middle">帶外低</text>`;
+  cells.forEach((row,r)=>row.forEach((name,c)=>{const x=78+c*224/3,y=58+r*60;svg+=`<rect x="${x}" y="${y}" width="${224/3}" height="60" class="zone-cell ${name==='正中'?'heart':''}"/><text x="${x+224/6}" y="${y+34}" text-anchor="middle">${name}</text>`}));
+  host.innerHTML=svg+`<text x="78" y="304" class="definition-axis">← 內角</text><text x="302" y="304" text-anchor="end" class="definition-axis">外角 →</text></svg>`;
 }
 
 function renderTree() {

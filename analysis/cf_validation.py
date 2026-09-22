@@ -11,7 +11,7 @@ cf_validation.py
   打者類型   上一季揮空率 x 強擊率，各分高 / 中 / 低 (9 類，新人排除)
   前一球     球種族 + 位置 + 打者反應 (打席第一球則為「無」)
 
-下一球 (variant)：球種族 x 位置 (好球帶上 / 中 / 下、帶外高 / 低 / 內角 / 外角)
+下一球 (variant)：球種族 x 位置 (好球帶九宮格、帶外高 / 低 / 內角 / 外角)
 
 兩種比較：
   1. 實際投出的球：同一情境中，下一球 A 與 B 的實際發生率差距 vs 模型對這些球的平均預測差距
@@ -52,6 +52,7 @@ sys.path.insert(0, str(ROOT / "data_preparation"))
 
 import splits as sp                                    # noqa: E402
 from batter_profile import FAMILIES                    # noqa: E402
+from analysis.pitch_regions import region              # noqa: E402
 from modeling import features as F                     # noqa: E402
 from modeling.evaluate import load_model, predict      # noqa: E402
 from modeling.outcomes import EVENTS                   # noqa: E402
@@ -78,20 +79,6 @@ OUTCOMES = {  # 名稱: 由哪些事件組成
 }
 FAMILY_ZH = {"fastball": "四縫線", "sinker": "伸卡", "cutter": "卡特", "slider": "滑球",
              "curveball": "曲球", "changeup": "變速"}
-IN_ZONE_ROW = {1: "上", 2: "上", 3: "上", 4: "中", 5: "中", 6: "中", 7: "下", 8: "下", 9: "下"}
-
-
-def region(df: pd.DataFrame) -> pd.Series:
-    """好球帶內：Savant zone 的上 / 中 / 下三排。
-    好球帶外：以座標分成高、低、內角、外角四個緊密方向。
-    不用 Savant 的 11-14 區：那四區各自橫跨左右兩側，同一區的球位置差很多。"""
-    inside = df["zone"].map(IN_ZONE_ROW)
-    out = np.select([df["plate_z_norm"] > 1.0, df["plate_z_norm"] < 0.0, df["plate_x_bv"] < 0],
-                    ["帶外高", "帶外低", "帶外內角"], "帶外外角")
-    r = inside.fillna(pd.Series(out, index=df.index))
-    return r.where(df["zone"].notna(), "未知")
-
-
 def log(msg: str) -> None:
     print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
 

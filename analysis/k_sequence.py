@@ -53,7 +53,8 @@ sys.path.insert(0, str(ROOT / "data_preparation"))
 
 import data_spec as spec                               # noqa: E402
 import splits as sp                                    # noqa: E402
-from analysis.cf_validation import FAMILY_ZH, SWAP_COLS, region  # noqa: E402
+from analysis.cf_validation import FAMILY_ZH, SWAP_COLS         # noqa: E402
+from analysis.pitch_regions import IN_ZONE_NAMES, OUT_ZONE_NAMES, region  # noqa: E402
 from modeling import features as F                     # noqa: E402
 from modeling.evaluate import load_model, predict      # noqa: E402
 from modeling.outcomes import EVENTS                   # noqa: E402
@@ -503,6 +504,36 @@ def enumerate_paths(nodes, policy, cand):
     return paths
 
 
+def candidate_detail(cand, choice, pitch_number=None, count=None):
+    """Return the representative real pitch used by a strategy node."""
+    row = cand.iloc[int(choice)]
+    variant = str(row["variant"])
+    value = {
+        "variant": variant,
+        "family": str(row.get("pitch_family", "")),
+        "family_zh": variant.split("_", 1)[0],
+        "region": str(row.get("region", variant.split("_", 1)[-1])),
+        "plate_x_bv": float(row["plate_x_bv"]),
+        "plate_z_norm": float(row["plate_z_norm"]),
+    }
+    if pitch_number is not None:
+        value["pitch_number"] = int(pitch_number)
+    if count is not None:
+        value["count"] = str(count)
+    return value
+
+
+def path_pitch_details(path, cand):
+    """Extract ordered pitch variants/counts from a human-readable path."""
+    details = []
+    for match in re.finditer(r"第\s*(\d+)\s*球\s*\(([^)]+)\)\s*([^→；]+?)\s*→", path):
+        number, count, variant = int(match.group(1)), match.group(2), match.group(3).strip()
+        choices = cand.index[cand["variant"] == variant]
+        if len(choices):
+            details.append(candidate_detail(cand, cand.index.get_loc(choices[0]), number, count))
+    return details
+
+
 def serialize_policy_tree(nodes, policy, cand):
     """Serialize the chosen adaptive policy as a compact, UI-friendly tree."""
     terminal_names = {"K": "三振", "BB": "保送", "soft": "弱擊", "hard": "強擊"}
@@ -538,7 +569,9 @@ def serialize_policy_tree(nodes, policy, cand):
             })
         return {
             "type": "decision", "depth": depth, "count": f"{balls}-{strikes}",
-            "pitch": cand.at[choice, "variant"], "children": children,
+            "pitch": cand.at[choice, "variant"],
+            "pitch_detail": candidate_detail(cand, choice, depth, f"{balls}-{strikes}"),
+            "children": children,
         }
 
     return rec((), 1)
@@ -615,6 +648,7 @@ def run(run_dir: Path, device: str, out_dir: Path | None = None):
                             "5球內弱擊": res["soft"] if res else np.nan, "5球後未結束": res["unfinished"] if res else np.nan,
                             "門檻": threshold, "達到門檻的球數": reach})
         write_batter(out, name, bt, cand, strategies, threshold, nodes, policy, seq, k_rate, st.n_evals,
+                     model_run=run_dir.name,
                      p_throws=pt["p_throws"],
                      greedy_policy=greedy_policy, fixed_ranked=fixed_ranked)
 
@@ -637,7 +671,7 @@ def sim_path_lines(res, top=5):
 
 
 def write_batter(out, name, bt, cand, strategies, threshold, nodes, policy, seq, k_rate, n_evals,
-                 p_throws=None, greedy_policy=None, fixed_ranked=None):
+                 model_run=None, p_throws=None, greedy_policy=None, fixed_ranked=None):
     pct = lambda v: "-" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:.1%}"
     lines = [f"# {PITCHER[0]} vs {name} (站位 {bt['stand']})", "", f"情境：{CONTEXT_TEXT}", "",
              f"門檻 = {PITCHER[0]} {SEASON} 年對其他{'右' if bt['stand'] == 'R' else '左'}打 (排除 {name}) 實際三振率 {k_rate:.1%} x {THRESHOLD_MULT} = **{threshold:.1%}**",
@@ -690,7 +724,8 @@ def write_batter(out, name, bt, cand, strategies, threshold, nodes, policy, seq,
         if res and "paths" in res:
             for ending in ("K", "hard"):
                 top_paths[ending] = [
-                    {"probability": float(prob), "sequence": path}
+                    {"probability": float(prob), "sequence": path,
+                     "pitches": path_pitch_details(path, cand)}
                     for prob, path, end in res["paths"] if end == ending
                 ][:5]
         strategy_json.append({
@@ -720,8 +755,9 @@ def write_batter(out, name, bt, cand, strategies, threshold, nodes, policy, seq,
 
     actual_label = next((s["name"] for s in strategy_json if s["name"].startswith("實際：對其他")), None)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "model_run": model_run,
         "pitcher": {"id": int(PITCHER[1]), "name": PITCHER[0], "throws": p_throws},
         "batter": {"id": int(bt["batter"]), "name": name, "stand": bt["stand"]},
         "season": SEASON,
@@ -739,9 +775,15 @@ def write_batter(out, name, bt, cand, strategies, threshold, nodes, policy, seq,
         "policy_tree": serialize_policy_tree(nodes, policy, cand),
         "fixed_sequences": [
             {"rank": i, "k_probability": float(k),
-             "pitches": [cand.at[int(c), "variant"] for c in sq]}
+             "pitches": [cand.at[int(c), "variant"] for c in sq],
+             "pitch_details": [candidate_detail(cand, c, n) for n, c in enumerate(sq, 1)]}
             for i, (sq, k) in enumerate(fixed_ranked or [], 1)
         ],
+        "location_definition": {
+            "coordinate_system": "打者視角；plate_x_bv -1=內角邊緣、+1=外角邊緣；plate_z_norm 0=下緣、1=上緣",
+            "in_zone": [list(row) for row in IN_ZONE_NAMES],
+            "out_zone": list(OUT_ZONE_NAMES),
+        },
         "candidates": clean(cand.sort_values("n", ascending=False).to_dict(orient="records")),
         "report_file": f"{slug}.md",
     }

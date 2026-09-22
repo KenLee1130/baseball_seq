@@ -17,23 +17,35 @@
 
   <main>
     <section class="hero">
-      <p class="eyebrow">K-SEQUENCE DECISION LAB</p>
-      <h1>五球之內，<br><em>怎麼拿下三振？</em></h1>
-      <p class="lede">從實際球路建立候選，讓模型比較應變、固定、貪婪與投手原有配球。每個建議都能一路展開成決策樹。</p>
+      <aside class="zone-definition panel">
+        <div><p class="eyebrow">LOCATION DICTIONARY</p><h2>位置怎麼命名？</h2></div>
+        <div id="zoneDefinition" class="zone-definition-map"></div>
+        <p>以打者視角翻正：左側是內角、右側是外角。策略圖會依指定打者的左右站位鏡像顯示。</p>
+      </aside>
+      <div class="hero-copy">
+        <p class="eyebrow">K-SEQUENCE DECISION LAB</p>
+        <h1>五球之內，<br><em>怎麼拿下三振？</em></h1>
+        <p class="lede">從實際球路建立候選，讓最新模型比較應變、固定、貪婪與投手原有配球。展開策略列，就能直接看見每一球的落點。</p>
+      </div>
     </section>
 
     <section class="selector panel">
-      <div class="step"><span>01</span><label for="runSelect">模型版本</label><select id="runSelect"></select></div>
-      <div class="step"><span>02</span><label for="pitcherSelect">選擇投手</label><select id="pitcherSelect"></select></div>
+      <div class="model-lock"><span>LATEST MODEL</span><b id="modelName">讀取中…</b><small>固定使用最新完整模型</small></div>
+      <div class="step"><span>01</span><label for="pitcherSelect">選擇投手</label><select id="pitcherSelect"></select></div>
       <div class="step target-step">
-        <span>03</span><label for="batterSelect">指定打者</label>
+        <span>02</span><label for="batterSelect">指定打者</label>
         <div class="hand-filter" role="group" aria-label="打擊站位">
           <button data-hand="all" class="active">全部</button><button data-hand="R">右打</button><button data-hand="L">左打</button>
         </div>
         <select id="batterSelect"></select>
       </div>
       <button class="analyze-button" id="analyzeButton"><span>開始分析</span><b>→</b></button>
-      <p class="selector-note">分析會在背景執行；完整搜尋可能需要一段時間。相同組合會直接讀取快取。</p>
+      <p class="selector-note">分析會在背景執行；完整搜尋可能需要一段時間。只使用最新完整模型，舊版輸入規則與舊結果不會混用。</p>
+    </section>
+
+    <section class="job panel" id="jobPanel" hidden aria-live="polite">
+      <div class="job-head"><div><p class="eyebrow">ACTIVE ANALYSES</p><h2>正在進行的分析</h2><p>離開或重新整理頁面不會中斷分析，完成後會自動移到「已完成的分析」。</p></div><div class="active-count" id="activeJobCount"></div></div>
+      <div class="job-list" id="jobList"></div>
     </section>
 
     <section class="history-wrap" id="historyWrap" hidden>
@@ -41,16 +53,10 @@
       <div class="history-list" id="historyList"></div>
     </section>
 
-    <section class="job panel" id="jobPanel" hidden>
-      <div class="job-head"><div><p class="eyebrow">ANALYSIS RUNNING</p><h2 id="jobTitle">模型正在搜尋策略樹</h2></div><div class="spinner"></div></div>
-      <div class="progress-track"><i></i></div>
-      <pre id="jobLog">準備資料…</pre>
-    </section>
-
     <section id="results" hidden>
       <div class="matchup-head">
         <div><p class="eyebrow">MATCHUP REPORT</p><h2><span id="pitcherName"></span><small>VS</small><span id="batterName"></span></h2><p id="contextText"></p></div>
-        <div class="matchup-tags"><span id="handTag"></span><span>最多 5 球</span><span id="modelTag">模型模擬</span></div>
+        <div class="matchup-tags"><span id="handTag"></span><span>最多 5 球</span><span id="modelTag">模型模擬</span><button id="downloadBundle">下載完整結果</button></div>
       </div>
 
       <div class="metric-grid" id="metricGrid"></div>
@@ -69,13 +75,8 @@
       </div>
 
       <article class="panel strategy-panel">
-        <div class="panel-title"><div><p class="eyebrow">STRATEGY COMPARISON</p><h3>策略與真實結果</h3></div><span class="threshold" id="thresholdLabel"></span></div>
-        <div class="table-scroll"><table><thead><tr><th>策略</th><th>3 球內</th><th>4 球內</th><th>5 球內三振</th><th>保送</th><th>強擊</th><th>弱擊</th><th>未結束</th></tr></thead><tbody id="strategyRows"></tbody></table></div>
-      </article>
-
-      <article class="panel paths-panel" id="pathsPanel">
-        <div class="panel-title"><div><p class="eyebrow">SEQUENCE EXAMPLES</p><h3>各策略的三振配球路徑</h3></div><select id="pathStrategy"></select></div>
-        <div class="path-list" id="pathList"></div>
+        <div class="panel-title"><div><p class="eyebrow">STRATEGY COMPARISON</p><h3>策略與真實結果</h3><p class="table-hint">點擊推薦策略即可展開配球序列與落點圖。</p></div><span class="threshold" id="thresholdLabel"></span></div>
+        <div class="table-scroll"><table><thead><tr><th>策略／配球圖</th><th>3 球內</th><th>4 球內</th><th>5 球內三振</th><th>保送</th><th>強擊</th><th>弱擊</th><th>未結束</th></tr></thead><tbody id="strategyRows"></tbody></table></div>
       </article>
 
       <article class="panel tree-panel">
